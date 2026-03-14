@@ -1,0 +1,15 @@
+# aimastering-audition: Time-Series Circuit Envelope Function
+# These are the only dependencies. Nothing more. Nothing less.
+
+# Signal processing (the physics layer)
+numpy>=1.26,<2.0
+scipy>=1.12,<2.0
+soundfile>=0.12,<1.0
+
+# API framework (the gateway, not the brain)
+fastapi>=0.110,<1.0
+uvicorn>=0.29,<1.0
+python-multipart>=0.0.9,<1.0
+
+# HTTP client (URL-based audio fetch)
+httpx>=0.27,<1.0
