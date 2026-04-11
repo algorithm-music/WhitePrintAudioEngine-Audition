@@ -251,7 +251,7 @@ async def health() -> JSONResponse:
         "service": "audition",
         "version": "2.1.0",
         "engine": "audio_analysis",
-        "envelope_dimensions": 8,
+        "envelope_dimensions": 9,
         "stores_audio": False,
     })
 
