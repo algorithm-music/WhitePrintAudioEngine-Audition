@@ -30,7 +30,7 @@ from scipy.signal import butter, resample_poly, sosfilt
 # ──────────────────────────────────────────
 LOG_FLOOR = 1e-10
 A4_HZ = 440.0
-TIME_SERIES_RESOLUTION_SEC = 1.0
+TIME_SERIES_RESOLUTION_SEC = 0.1
 
 # 6-band spectral division (Sub / Bass / LowMid / Mid / High / Air)
 BAND_EDGES = {
@@ -339,7 +339,7 @@ def _compute_whole_track_metrics(
     mid_rms = np.sqrt(np.mean(mid_signal ** 2))
     stereo_width = np.clip(side_rms / (mid_rms + LOG_FLOOR), 0.0, 1.0)
 
-    stereo_correlation = np.corrcoef(left_channel[::100], right_channel[::100])[0, 1]
+    stereo_correlation = np.corrcoef(left_channel, right_channel)[0, 1]
     low_mono_correlation = float(np.mean(circuit_envelopes.get("low_mono_correlation", [1.0])))
 
     return {
@@ -426,7 +426,7 @@ def _detect_physical_sections(total_samples: int, sample_rate: int, circuit_enve
 
 
 def _estimate_bpm(mono_signal: NDArray, sample_rate: int) -> Optional[float]:
-    chunk_for_bpm = mono_signal[:int(sample_rate * 30)]
+    chunk_for_bpm = mono_signal  # Analyze full track for accurate BPM
     frames = sliding_window_view(chunk_for_bpm, window_shape=1024)[::512]
     
     if len(frames) == 0:
@@ -448,7 +448,7 @@ def _estimate_bpm(mono_signal: NDArray, sample_rate: int) -> Optional[float]:
 
 
 def _estimate_key(mono_signal: NDArray, sample_rate: int) -> Optional[str]:
-    chunk_for_key = mono_signal[:int(sample_rate * 30)]
+    chunk_for_key = mono_signal  # Analyze full track for accurate key detection
     fft_result = np.abs(np.fft.rfft(chunk_for_key))
     frequencies = np.fft.rfftfreq(len(chunk_for_key), 1.0 / sample_rate)
     
@@ -506,10 +506,10 @@ def _detect_problems(whole_metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
         
     # Phase Cancellation in Lows (< 120Hz)
     low_mono_correlation = whole_metrics.get("low_mono_correlation_below_120hz", 1.0)
-    if low_mono_correlation < 0.7:
+    if low_mono_correlation < 0.3:
         detected_problems.append({
             "issue": "phase_cancellation_lows",
-            "severity": "high",
+            "severity": "medium",
             "value": low_mono_correlation
         })
 
@@ -522,12 +522,12 @@ def _detect_problems(whole_metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
             "value": harshness_risk
         })
 
-    # Crest Factor below 6dB (hyper-compressed source)
+    # Crest Factor observation (informational, not a problem)
     crest_db = whole_metrics.get("crest_db", 20.0)
-    if crest_db < 6.0:
+    if crest_db < 3.0:
         detected_problems.append({
-            "issue": "hyper_compressed_source",
-            "severity": "medium",
+            "issue": "extremely_low_crest_factor",
+            "severity": "low",
             "value": crest_db
         })
         

@@ -161,7 +161,7 @@ async def analyze(file: UploadFile = File(...)) -> JSONResponse:
         logger.error(f"Analysis failed: {type(analysis_error).__name__}: {analysis_error}")
         raise HTTPException(
             status_code=500,
-            detail=f"Analysis failed: {type(analysis_error).__name__}: {analysis_error}",
+            detail="Analysis failed. Check server logs for details.",
         )
     finally:
         if os.path.exists(input_path):
@@ -219,7 +219,7 @@ async def analyze_url(req: AnalyzeUrlRequest) -> JSONResponse:
             analysis_result = analyze_audio_file(input_path)
         except Exception as e:
             logger.error(f"Analysis failed: {type(e).__name__}: {e}")
-            raise HTTPException(status_code=500, detail=f"Analysis failed: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail="Analysis failed. Check server logs for details.")
 
         return JSONResponse(content=analysis_result)
         
