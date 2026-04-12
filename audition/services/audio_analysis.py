@@ -70,12 +70,19 @@ class TrackSpectrum:
 
 
 class SectionSemanticContext(typing.TypedDict):
-    """Strict Gemini output schema."""
-
+    """AI-driven section with timestamps and semantics."""
+    section_name: str
+    start_sec: float
+    end_sec: float
     primary_instruments: List[str]
     musical_scene: str
     genre_foundation: str
     rhythmic_density: str
+
+
+class MacroFormResponse(typing.TypedDict):
+    """Top-level Gemini response for full song structure."""
+    sections: List[SectionSemanticContext]
 
 
 def _build_k_weight_sos(sr: int) -> NDArray:
@@ -345,11 +352,14 @@ def _true_peak_chunked(left: NDArray, right: NDArray) -> float:
     return float(max(tpm, gm))
 
 
-def _extract_context(
-    chunk: NDArray, sr: int,
-) -> Optional[Dict[str, Any]]:
-    """Gemini native multimodal audio context extraction."""
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+def _extract_macro_form(
+    mono: NDArray, sr: int, duration: float,
+) -> Optional[List[Dict[str, Any]]]:
+    """Listen to full track once with Gemini, get sections + semantics."""
+    api_key = (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    )
     if not api_key:
         return None
 
@@ -359,32 +369,41 @@ def _extract_context(
     )
     model = genai.GenerativeModel(model_name)
 
+    # Downsample to 16kHz mono for fast upload
+    target_sr = 16000
+    down = resample_poly(mono, target_sr, sr)
+
     with tempfile.NamedTemporaryFile(
         suffix=".wav", delete=False
     ) as tmp:
-        sf.write(tmp.name, chunk, sr)
+        sf.write(tmp.name, down, target_sr)
         tp = tmp.name
 
     try:
         af = genai.upload_file(path=tp)
         prompt = (
-            "You are a mastering engineer. "
-            "Extract context from this audio "
-            "strictly into the JSON schema. "
-            "Be precise, no poetry."
+            f"Listen to this track ({duration:.1f}s). "
+            "Divide it into main musical sections "
+            "(Intro, Verse, Build-up, Drop, Breakdown, Outro, etc). "
+            "RULES: "
+            "1. First section starts at 0.0. "
+            f"2. Last section ends at {duration:.1f}. "
+            "3. No section shorter than 15 seconds. "
+            "4. Be objective and precise."
         )
         resp = model.generate_content(
             [prompt, af],
             generation_config=GenerationConfig(
                 response_mime_type="application/json",
-                response_schema=SectionSemanticContext,
+                response_schema=MacroFormResponse,
                 temperature=0.0,
             ),
         )
         genai.delete_file(af.name)
-        return json.loads(resp.text)
+        result = json.loads(resp.text)
+        return result.get("sections", [])
     except Exception as e:
-        print(f"[WARN] Gemini failed: {e}")
+        print(f"[WARN] Gemini macro-form failed: {e}")
         return None
     finally:
         if os.path.exists(tp):
@@ -394,14 +413,66 @@ def _extract_context(
 def _detect_sections(
     mono: NDArray, sr: int, envs: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """DSP section detection + Gemini semantic context."""
+    """AI-driven segmentation with DSP fallback."""
     lufs_e = np.array(envs.get("lufs", []))
     width_e = np.array(envs.get("width", []))
+    duration = float(len(mono) / sr)
+    res = TIME_SERIES_RESOLUTION_SEC
 
+    # 1. Try Gemini (1 API call for entire track)
+    ai_secs = _extract_macro_form(mono, sr, duration)
+
+    if ai_secs and len(ai_secs) > 0:
+        sections = []
+        for idx, sec in enumerate(ai_secs):
+            ss = max(0.0, float(sec.get("start_sec", 0)))
+            es = min(duration, float(sec.get("end_sec", duration)))
+            if es - ss < 1.0:
+                continue
+
+            si = int(ss / res)
+            ei = min(int(es / res), len(lufs_e))
+            al = (
+                round(float(np.mean(lufs_e[si:ei])), 1)
+                if si < ei and ei <= len(lufs_e) else -14.0
+            )
+            aw = (
+                round(float(np.mean(width_e[si:ei])), 3)
+                if si < ei and ei <= len(width_e) else 0.0
+            )
+
+            name = sec.get("section_name", "Part")
+            ctx = {
+                "primary_instruments": sec.get("primary_instruments", []),
+                "musical_scene": sec.get("musical_scene", ""),
+                "genre_foundation": sec.get("genre_foundation", ""),
+                "rhythmic_density": sec.get("rhythmic_density", ""),
+            }
+
+            sections.append({
+                "section_id": f"SEC_{idx}_{name.replace(' ', '')}",
+                "start_sec": round(ss, 2),
+                "end_sec": round(es, 2),
+                "avg_lufs": al,
+                "avg_width": aw,
+                "semantic_context": ctx,
+            })
+        if sections:
+            return sections
+
+    # 2. DSP fallback (no Gemini)
+    return _dsp_fallback(lufs_e, width_e, duration)
+
+
+def _dsp_fallback(
+    lufs_e: NDArray, width_e: NDArray, duration: float,
+) -> List[Dict[str, Any]]:
+    """DSP novelty-based segmentation (15s min)."""
     if len(lufs_e) < 100:
         return [{
+            "section_id": "SEC_0_Full",
             "start_sec": 0.0,
-            "end_sec": float(len(mono) / sr),
+            "end_sec": duration,
             "avg_lufs": round(float(np.mean(lufs_e)), 1)
             if len(lufs_e) > 0 else -14.0,
             "avg_width": round(float(np.mean(width_e)), 3)
@@ -413,7 +484,6 @@ def _detect_sections(
     w = np.ones(sw) / sw
     sl = np.convolve(lufs_e, w, mode="same")
     swi = np.convolve(width_e, w, mode="same")
-
     ld = np.abs(np.diff(sl))
     wd = np.abs(np.diff(swi))
     ln = ld / (np.max(ld) + 1e-6)
@@ -422,7 +492,7 @@ def _detect_sections(
 
     th = np.mean(nov) + 1.2 * np.std(nov)
     bounds = [0]
-    mc = int(15.0 / TIME_SERIES_RESOLUTION_SEC)  # 15s minimum
+    mc = int(15.0 / TIME_SERIES_RESOLUTION_SEC)
 
     for i in range(1, len(nov) - 1):
         if (
@@ -433,39 +503,25 @@ def _detect_sections(
             if (i - bounds[-1]) > mc:
                 bounds.append(i)
 
-    # Merge tail: if last segment < 15s, extend previous
     total = len(lufs_e)
     if total - bounds[-1] < mc and len(bounds) > 1:
         bounds[-1] = total
     else:
         bounds.append(total)
 
+    res = TIME_SERIES_RESOLUTION_SEC
     secs = []
-
     for idx in range(len(bounds) - 1):
         si = bounds[idx]
         ei = bounds[idx + 1]
-        ss = float(si * TIME_SERIES_RESOLUTION_SEC)
-        es = float(ei * TIME_SERIES_RESOLUTION_SEC)
-        s_samp = int(ss * sr)
-        e_samp = int(es * sr)
-        chunk = mono[s_samp:e_samp]
-
-        ctx = _extract_context(chunk, sr)
-
         secs.append({
-            "section_id": f"SEC_{idx}",
-            "start_sec": ss,
-            "end_sec": es,
-            "avg_lufs": round(
-                float(np.mean(lufs_e[si:ei])), 1
-            ),
-            "avg_width": round(
-                float(np.mean(width_e[si:ei])), 3
-            ),
-            "semantic_context": ctx,
+            "section_id": f"SEC_{idx}_Part",
+            "start_sec": round(float(si * res), 2),
+            "end_sec": round(float(ei * res), 2),
+            "avg_lufs": round(float(np.mean(lufs_e[si:ei])), 1),
+            "avg_width": round(float(np.mean(width_e[si:ei])), 3),
+            "semantic_context": None,
         })
-
     return secs
 
 
