@@ -87,47 +87,39 @@ async def validate(file: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse(content={"status": "valid", "validation": result})
 
 
+class AnalyzeRequest(BaseModel):
+    local_path: str = Field(..., description="Absolute path on the mounted volume")
+
+
 @app.post("/internal/analyze")
-async def analyze(file: UploadFile = File(...)) -> JSONResponse:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        path = tmp.name
-    try:
-        await asyncio.to_thread(validate_audio_file, path)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    try:
-        result = await asyncio.to_thread(analyze_audio_file, path)
-    except Exception as e:
-        logger.error(f"Analysis failed: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail="Analysis failed.")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
-    return JSONResponse(content=result)
+async def analyze(req: AnalyzeRequest) -> JSONResponse:
+    path = req.local_path
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found on volume.")
 
-
-@app.post("/internal/analyze-stream")
-async def analyze_stream(request: Request) -> JSONResponse:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        path = tmp.name
-        async for chunk in request.stream():
-            tmp.write(chunk)
+    # FUSE workaround: copy to local /tmp to avoid libsndfile SystemError on GCS FUSE mounts
+    fd, local_tmp = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    
     try:
-        await asyncio.to_thread(validate_audio_file, path)
-    except ValueError as e:
-        if os.path.exists(path):
-            os.remove(path)
-        raise HTTPException(status_code=422, detail=str(e))
-    try:
-        result = await asyncio.to_thread(analyze_audio_file, path)
-    except Exception as e:
-        logger.error(f"Analysis failed: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail="Analysis failed.")
+        await asyncio.to_thread(shutil.copy2, path, local_tmp)
+        
+        try:
+            await asyncio.to_thread(validate_audio_file, local_tmp)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        
+        try:
+            result = await asyncio.to_thread(analyze_audio_file, local_tmp)
+        except Exception as e:
+            logger.error(f"Analysis failed: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail="Analysis failed.")
+            
+        return JSONResponse(content=result)
     finally:
-        if os.path.exists(path):
-            os.remove(path)
-    return JSONResponse(content=result)
+        if os.path.exists(local_tmp):
+            os.remove(local_tmp)
+
 
 
 class AnalyzeUrlRequest(BaseModel):
