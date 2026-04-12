@@ -17,7 +17,7 @@ Audio → Physics JSON. Forget everything after response.
 ```bash
 gcloud run deploy aimastering-audition \
   --source . --region asia-northeast1 \
-  --memory 2Gi --cpu 2 --concurrency 1 --ingress internal
+  --memory 4Gi --cpu 2 --timeout 300 --concurrency 1 --ingress internal
 ```
 
 © YOMIBITO SHIRAZU — WhitePrintAudioEngine
