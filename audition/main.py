@@ -107,6 +107,29 @@ async def analyze(file: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse(content=result)
 
 
+@app.post("/internal/analyze-stream")
+async def analyze_stream(request: Request) -> JSONResponse:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        path = tmp.name
+        async for chunk in request.stream():
+            tmp.write(chunk)
+    try:
+        await asyncio.to_thread(validate_audio_file, path)
+    except ValueError as e:
+        if os.path.exists(path):
+            os.remove(path)
+        raise HTTPException(status_code=422, detail=str(e))
+    try:
+        result = await asyncio.to_thread(analyze_audio_file, path)
+    except Exception as e:
+        logger.error(f"Analysis failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Analysis failed.")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    return JSONResponse(content=result)
+
+
 class AnalyzeUrlRequest(BaseModel):
     audio_url: str = Field(..., description="Direct download URL")
 
