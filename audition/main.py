@@ -157,7 +157,15 @@ async def analyze_url(req: AnalyzeUrlRequest) -> JSONResponse:
 
 @app.get("/")
 async def index():
-    return JSONResponse(content={"status": "online", "service": "audition"})
+    return JSONResponse(
+        content={
+            "status": "online",
+            "service": "audition",
+            "engine": "Audio Analysis & Semantic Extraction Engine",
+            "message": "Audition microservice is ready.",
+            "documentation": "/docs"
+        }
+    )
 
 
 @app.get("/health")
