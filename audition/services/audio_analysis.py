@@ -422,7 +422,7 @@ def _detect_sections(
 
     th = np.mean(nov) + 1.2 * np.std(nov)
     bounds = [0]
-    mc = int(8.0 / TIME_SERIES_RESOLUTION_SEC)
+    mc = int(15.0 / TIME_SERIES_RESOLUTION_SEC)  # 15s minimum
 
     for i in range(1, len(nov) - 1):
         if (
@@ -433,7 +433,13 @@ def _detect_sections(
             if (i - bounds[-1]) > mc:
                 bounds.append(i)
 
-    bounds.append(len(lufs_e))
+    # Merge tail: if last segment < 15s, extend previous
+    total = len(lufs_e)
+    if total - bounds[-1] < mc and len(bounds) > 1:
+        bounds[-1] = total
+    else:
+        bounds.append(total)
+
     secs = []
 
     for idx in range(len(bounds) - 1):
