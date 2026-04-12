@@ -390,11 +390,11 @@ def _true_peak_estimate_chunked(left_channel: NDArray, right_channel: NDArray) -
 # Physical Section Boundaries & Meta Estimations
 # ══════════════════════════════════════════
 def _detect_physical_sections(total_samples: int, sample_rate: int, circuit_envelopes: Dict[str, Any]) -> List[Dict[str, Any]]:
-  """Identifies major energy shifts and aggregates evidence for the AI's Attention mechanism."""
+  """Identifies major energy and spatial shifts to define musical macro-form (sections)."""
   lufs_envelope = np.array(circuit_envelopes.get("lufs", []))
   width_envelope = np.array(circuit_envelopes.get("width", []))
 
-  if len(lufs_envelope) < 10:
+  if len(lufs_envelope) < 100:
     return [{
       "start_sec": 0.0,
       "end_sec": float(total_samples / sample_rate),
@@ -402,17 +402,36 @@ def _detect_physical_sections(total_samples: int, sample_rate: int, circuit_enve
       "avg_width": round(float(np.mean(width_envelope)), 3) if len(width_envelope) > 0 else 0.0
     }]
 
-  lufs_differences = np.abs(np.diff(lufs_envelope))
-  detection_threshold = np.mean(lufs_differences) + 1.5 * np.std(lufs_differences)
+  # 1. Smooth to capture macro structure (3-second moving average)
+  smooth_window = int(3.0 / TIME_SERIES_RESOLUTION_SEC)
+  weights = np.ones(smooth_window) / smooth_window
+  smoothed_lufs = np.convolve(lufs_envelope, weights, mode='same')
+  smoothed_width = np.convolve(width_envelope, weights, mode='same')
 
+  # 2. Rate of change on smoothed signals
+  lufs_diff = np.abs(np.diff(smoothed_lufs))
+  width_diff = np.abs(np.diff(smoothed_width))
+
+  # 3. Normalize and blend LUFS + Width novelty (70/30 weight)
+  lufs_diff_norm = lufs_diff / (np.max(lufs_diff) + 1e-6)
+  width_diff_norm = width_diff / (np.max(width_diff) + 1e-6)
+  combined_novelty = lufs_diff_norm + (width_diff_norm * 0.3)
+
+  # 4. Peak-picking boundary detection
+  threshold = np.mean(combined_novelty) + 1.2 * np.std(combined_novelty)
   boundaries = [0]
-  for idx, diff in enumerate(lufs_differences):
-    min_section_chunks = int(8.0 / TIME_SERIES_RESOLUTION_SEC)  # Always minimum 8 seconds
-    if diff > detection_threshold and (idx - boundaries[-1]) > min_section_chunks:
-      boundaries.append(idx + 1)
+  min_section_chunks = int(8.0 / TIME_SERIES_RESOLUTION_SEC)
+
+  for i in range(1, len(combined_novelty) - 1):
+    if (combined_novelty[i] > threshold and
+        combined_novelty[i] > combined_novelty[i-1] and
+        combined_novelty[i] > combined_novelty[i+1]):
+      if (i - boundaries[-1]) > min_section_chunks:
+        boundaries.append(i)
 
   boundaries.append(len(lufs_envelope))
 
+  # 5. Build sections
   sections = []
   for idx in range(len(boundaries) - 1):
     start_index = boundaries[idx]
