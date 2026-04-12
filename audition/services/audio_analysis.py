@@ -1,631 +1,576 @@
 # pyre-ignore-all-errors
 
-"""
-Audio Analysis Service - Signal Processing & Feature Extraction
+"""Audio Analysis Service - Signal Processing & Feature Extraction.
 
-This module performs highly accurate audio analysis to feed the deliberation service.
-It strictly adheres to physical engineering principles and BS.1770-4 standards.
-
-Key responsibilities:
-- Extract Time-Series Circuit Envelopes (high-resolution, multi-dimensional signal flow)
-- Compute BS.1770-4 Integrated Loudness and LRA using strict K-weighting
-- Calculate True Peak using 4x oversampling
-- Identify physical section boundaries for macro-form analysis
-- Detect potential engineering issues (phase cancellation, mud, harshness, etc.)
+Performs BS.1770-4 compliant audio analysis with Gemini semantic extraction.
 """
 
-import io
+import json
+import os
 import struct
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import google.generativeai as genai
 import numpy as np
 import soundfile as sf
+import typing_extensions as typing
+from google.generativeai.types import GenerationConfig
 from numpy.lib.stride_tricks import sliding_window_view
 from numpy.typing import NDArray
 from scipy.signal import butter, resample_poly, sosfilt
 
-# ──────────────────────────────────────────
-# Constants & Profiles
-# ──────────────────────────────────────────
 LOG_FLOOR = 1e-10
 A4_HZ = 440.0
 TIME_SERIES_RESOLUTION_SEC = 0.1
 
-# 6-band spectral division (Sub / Bass / LowMid / Mid / High / Air)
 BAND_EDGES = {
-  "sub": (20.0, 60.0),
-  "bass": (60.0, 200.0),
-  "low_mid": (200.0, 500.0),
-  "mid": (500.0, 2000.0),
-  "high": (2000.0, 8000.0),
-  "air": (8000.0, None)
+    "sub": (20.0, 60.0),
+    "bass": (60.0, 200.0),
+    "low_mid": (200.0, 500.0),
+    "mid": (500.0, 2000.0),
+    "high": (2000.0, 8000.0),
+    "air": (8000.0, None),
 }
 
-MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+MAJOR_PROFILE = np.array(
+    [6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+     2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+)
+MINOR_PROFILE = np.array(
+    [6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+     2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+)
+NOTE_NAMES = (
+    "C", "C#", "D", "D#", "E", "F",
+    "F#", "G", "G#", "A", "A#", "B",
+)
 
 
-# ──────────────────────────────────────────
-# Data Structures
-# ──────────────────────────────────────────
 @dataclass(frozen=True)
 class TrackSpectrum:
-  """Pre-computed Fast Fourier Transform data to ensure maximum API throughput."""
-  freqs: NDArray[np.float64]
-  mono_power: NDArray[np.float64]
-  side_power: NDArray[np.float64]
+    """Pre-computed FFT data."""
 
-  @classmethod
-  def compute(cls, mono_signal: NDArray[np.float64], side_signal: NDArray[np.float64], sample_rate: int) -> "TrackSpectrum":
-    mono_power = np.abs(np.fft.rfft(mono_signal)) ** 2
-    side_power = np.abs(np.fft.rfft(side_signal)) ** 2
-    freqs = np.fft.rfftfreq(len(mono_signal), 1.0 / sample_rate)
-    return cls(freqs, mono_power, side_power)
+    freqs: NDArray[np.float64]
+    mono_power: NDArray[np.float64]
+    side_power: NDArray[np.float64]
 
-
-# ══════════════════════════════════════════
-# Signal Processing Utilities
-# ══════════════════════════════════════════
-def _build_k_weight_sos(sample_rate: int) -> NDArray:
-  """
-  Build BS.1770-4 K-weighting filter (pre-filter + RLB high-pass).
-  Constructs the exact BS.1770-4 K-weighting filter coefficients.
-  Safely stacks the SOS (Second-Order Sections) arrays.
-  """
-  # High-shelf (Pre-filter: boosts ~1.68kHz and above)
-  f0 = 1681.974450955533
-  gain = 4.0
-  Q = 0.7071752369554196
-  w0 = 2.0 * np.pi * f0 / sample_rate
-  A = 10.0 ** (gain / 40.0)
-  alpha = np.sin(w0) / (2.0 * Q)
-
-  b0 = A * ((A + 1.0) + (A - 1.0) * np.cos(w0) + 2.0 * np.sqrt(A) * alpha)
-  b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * np.cos(w0))
-  b2 = A * ((A + 1.0) + (A - 1.0) * np.cos(w0) - 2.0 * np.sqrt(A) * alpha)
-  a0 = (A + 1.0) - (A - 1.0) * np.cos(w0) + 2.0 * np.sqrt(A) * alpha
-  a1 = 2.0 * ((A - 1.0) - (A + 1.0) * np.cos(w0))
-  a2 = (A + 1.0) - (A - 1.0) * np.cos(w0) - 2.0 * np.sqrt(A) * alpha
-
-  sos_high_shelf = np.array([b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]).reshape(1, 6)
-
-  # High-pass (RLB filter: rolls off extreme lows below 38Hz)
-  sos_high_pass = butter(2, 38.0, btype='highpass', fs=sample_rate, output='sos')
-
-  return np.vstack([sos_high_shelf, sos_high_pass])
+    @classmethod
+    def compute(
+        cls,
+        mono: NDArray[np.float64],
+        side: NDArray[np.float64],
+        sr: int,
+    ) -> "TrackSpectrum":
+        mp = np.abs(np.fft.rfft(mono)) ** 2
+        sp = np.abs(np.fft.rfft(side)) ** 2
+        f = np.fft.rfftfreq(len(mono), 1.0 / sr)
+        return cls(f, mp, sp)
 
 
-# ══════════════════════════════════════════
-# API Entry Point
-# ══════════════════════════════════════════
-def validate_audio_file(file_path: str) -> Dict[str, Any]:
-  """Validates header integrity before committing to expensive computations."""
-  import os
-  if os.path.getsize(file_path) < 44:
-    raise ValueError("Invalid audio file: Too small to contain headers.")
-  try:
-    info = sf.info(file_path)
-  except Exception:
-    raise ValueError("Unsupported format. Permitted: WAV, FLAC, AIFF.")
+class SectionSemanticContext(typing.TypedDict):
+    """Strict Gemini output schema."""
 
-  if info.samplerate < 8000 or info.samplerate > 384000:
-    raise ValueError(f"Unsupported sample rate: {info.samplerate}Hz")
-
-  return {
-    "duration_sec": info.duration,
-    "sample_rate": info.samplerate,
-    "channels": info.channels
-  }
+    primary_instruments: List[str]
+    musical_scene: str
+    genre_foundation: str
+    rhythmic_density: str
 
 
-def analyze_audio_file(file_path: str) -> Dict[str, Any]:
-  """The immutable entry point for the REST API."""
-  data, sample_rate = sf.read(file_path, dtype="float64")
+def _build_k_weight_sos(sr: int) -> NDArray:
+    """BS.1770-4 K-weighting filter."""
+    f0 = 1681.974450955533
+    gain = 4.0
+    q = 0.7071752369554196
+    w0 = 2.0 * np.pi * f0 / sr
+    a_v = 10.0 ** (gain / 40.0)
+    alpha = np.sin(w0) / (2.0 * q)
+    cw = np.cos(w0)
+    sa = np.sqrt(a_v)
 
-  if data.ndim == 1:
-    data = np.column_stack([data, data])
+    b0 = a_v * ((a_v + 1) + (a_v - 1) * cw + 2 * sa * alpha)
+    b1 = -2 * a_v * ((a_v - 1) + (a_v + 1) * cw)
+    b2 = a_v * ((a_v + 1) + (a_v - 1) * cw - 2 * sa * alpha)
+    a0 = (a_v + 1) - (a_v - 1) * cw + 2 * sa * alpha
+    a1 = 2 * ((a_v - 1) - (a_v + 1) * cw)
+    a2 = (a_v + 1) - (a_v - 1) * cw - 2 * sa * alpha
 
-  left_channel = data[:, 0]
-  right_channel = data[:, 1]
-  mono_signal = (left_channel + right_channel) * 0.5
-  mid_signal = mono_signal
-  side_signal = (left_channel - right_channel) * 0.5
-
-  # Gemini二極コンテキスト: MonoとSide（Mid/Side）によるステレオの極性解析
-  spectrum = TrackSpectrum.compute(mono_signal, side_signal, sample_rate)
-
-  k_weight_sos = _build_k_weight_sos(sample_rate)
-  left_k_weighted = sosfilt(k_weight_sos, left_channel)
-  right_k_weighted = sosfilt(k_weight_sos, right_channel)
-  mono_k_weighted = (left_k_weighted + right_k_weighted) * 0.5
-
-  # 1. High-Resolution Circuit Envelopes (9 Dimensions)
-  circuit_envelopes = _compute_time_series_circuit_envelopes(
-    mono_signal, mono_k_weighted, side_signal, left_channel, right_channel, sample_rate
-  )
-
-  # 2. Global Baseline Metrics (Strict BS.1770-4 compliance)
-  whole_metrics = _compute_whole_track_metrics(
-    mono_signal, left_channel, right_channel, mid_signal, side_signal,
-    left_k_weighted, right_k_weighted, sample_rate, spectrum, circuit_envelopes
-  )
-
-  # 3. Physical Section Boundaries
-  physical_sections = _detect_physical_sections(
-    len(mono_signal), sample_rate, circuit_envelopes
-  )
-
-  return {
-    "track_identity": {
-      "duration_sec": round(float(len(data) / sample_rate), 2),
-      "sample_rate": sample_rate,
-      "bpm": _estimate_bpm(mono_signal, sample_rate),
-      "key": _estimate_key(mono_signal, sample_rate),
-      "bit_depth": _detect_bit_depth(file_path),
-    },
-    "whole_track_metrics": whole_metrics,
-    "time_series_circuit_envelopes": circuit_envelopes,
-    "physical_sections": physical_sections,
-    "detected_problems": _detect_problems(whole_metrics),
-  }
+    hs = np.array(
+        [b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]
+    ).reshape(1, 6)
+    hp = butter(2, 38.0, btype="highpass", fs=sr, output="sos")
+    return np.vstack([hs, hp])
 
 
-# ══════════════════════════════════════════
-# Time-Series Circuit Envelope Generation
-# ══════════════════════════════════════════
-def _compute_time_series_circuit_envelopes(
-  mono_signal: NDArray, mono_k_weighted: NDArray, side_signal: NDArray,
-  left_channel: NDArray, right_channel: NDArray, sample_rate: int
-) -> Dict[str, List[float]]:
-  """
-  Transforms the flow of time into explicitly defined, highly readable 9-dimensional envelopes.
-  Vectorized over chunks for extreme throughput.
-  """
-  chunk_size = int(sample_rate * TIME_SERIES_RESOLUTION_SEC)
-  number_of_chunks = len(mono_signal) // chunk_size
-
-  if number_of_chunks == 0:
-    return {}
-
-  valid_length = number_of_chunks * chunk_size
-  mono_chunks = mono_signal[:valid_length].reshape(number_of_chunks, chunk_size)
-  mono_k_chunks = mono_k_weighted[:valid_length].reshape(number_of_chunks, chunk_size)
-  side_chunks = side_signal[:valid_length].reshape(number_of_chunks, chunk_size)
-  left_chunks = left_channel[:valid_length].reshape(number_of_chunks, chunk_size)
-  right_chunks = right_channel[:valid_length].reshape(number_of_chunks, chunk_size)
-
-  # Dimension 1: Loudness (K-weighted, BS.1770-4)
-  mean_square_k = np.mean(mono_k_chunks ** 2, axis=1) + LOG_FLOOR
-  lufs_envelope = -0.691 + 10.0 * np.log10(mean_square_k)
-
-  # Dimension 2 & 3: Crest Factor & Stereo Width
-  rms_values = np.sqrt(np.mean(mono_chunks ** 2, axis=1) + LOG_FLOOR)
-  peak_values = np.max(np.abs(mono_chunks), axis=1)
-  crest_envelope = 20.0 * np.log10(np.maximum(peak_values, LOG_FLOOR)) - 20.0 * np.log10(rms_values)
-
-  side_rms_values = np.sqrt(np.mean(side_chunks ** 2, axis=1) + LOG_FLOOR)
-  width_envelope = np.clip(side_rms_values / rms_values, 0.0, 1.0)
-
-  # Spectral Base Computations
-  power_chunks = np.abs(np.fft.rfft(mono_chunks, axis=1)) ** 2
-  frequencies = np.fft.rfftfreq(chunk_size, 1.0 / sample_rate)
-  total_energy_per_chunk = np.sum(power_chunks[:, frequencies >= 20], axis=1) + LOG_FLOOR
-
-  # Dimension 4 & 5: Low-end Balance (Sub / Bass ratios)
-  sub_energy = np.sum(power_chunks[:, (frequencies >= 20) & (frequencies < 60)], axis=1)
-  bass_energy = np.sum(power_chunks[:, (frequencies >= 60) & (frequencies < 200)], axis=1)
-  sub_ratio_envelope = sub_energy / total_energy_per_chunk
-  bass_ratio_envelope = bass_energy / total_energy_per_chunk
-
-  # Dimension 6: Vocal Presence (1-5kHz energy ratio)
-  vocal_energy = np.sum(power_chunks[:, (frequencies >= 1000) & (frequencies < 5000)], axis=1)
-  vocal_presence_envelope = vocal_energy / total_energy_per_chunk
-
-  # Dimension 7: Spectral Brightness (spectral centroid)
-  weighted_frequencies = np.sum(power_chunks * frequencies, axis=1)
-  spectral_brightness_envelope = weighted_frequencies / total_energy_per_chunk / (chunk_size // 2)
-
-  # Dimension 8: Low Mono Correlation (< 120Hz L/R coherence)
-  sos_low_pass = butter(4, 120.0, btype='lowpass', fs=sample_rate, output='sos')
-  left_low_chunks = sosfilt(sos_low_pass, left_chunks, axis=1)
-  right_low_chunks = sosfilt(sos_low_pass, right_chunks, axis=1)
-
-  left_low_mean = np.mean(left_low_chunks, axis=1, keepdims=True)
-  right_low_mean = np.mean(right_low_chunks, axis=1, keepdims=True)
-
-  numerator = np.sum((left_low_chunks - left_low_mean) * (right_low_chunks - right_low_mean), axis=1)
-  denominator_left = np.sum((left_low_chunks - left_low_mean) ** 2, axis=1)
-  denominator_right = np.sum((right_low_chunks - right_low_mean) ** 2, axis=1)
-  denominator = np.sqrt(denominator_left * denominator_right) + LOG_FLOOR
-
-  low_mono_correlation_envelope = np.clip(numerator / denominator, -1.0, 1.0)
-
-  # Dimension 9: Transient Sharpness (onset strength via 1st derivative)
-  transient_sharpness_envelope = np.zeros(number_of_chunks)
-  for i in range(number_of_chunks):
-    chunk_diff = np.abs(np.diff(mono_chunks[i]))
-    transient_sharpness_envelope[i] = float(np.percentile(chunk_diff, 95))
-
-  def _round_list(array: NDArray, decimals: int) -> List[float]:
-    return [round(float(value), decimals) for value in array]
-
-  return {
-    "resolution_sec": TIME_SERIES_RESOLUTION_SEC,
-    "lufs": _round_list(lufs_envelope, 1),
-    "crest_db": _round_list(crest_envelope, 1),
-    "width": _round_list(width_envelope, 3),
-    "sub_ratio": _round_list(sub_ratio_envelope, 3),
-    "bass_ratio": _round_list(bass_ratio_envelope, 3),
-    "vocal_presence": _round_list(vocal_presence_envelope, 3),
-    "spectral_brightness": _round_list(spectral_brightness_envelope, 4),
-    "low_mono_correlation": _round_list(low_mono_correlation_envelope, 3),
-    "transient_sharpness": _round_list(transient_sharpness_envelope, 6),
-  }
+def validate_audio_file(fp: str) -> Dict[str, Any]:
+    """Validate audio file headers."""
+    if os.path.getsize(fp) < 44:
+        raise ValueError("File too small.")
+    try:
+        info = sf.info(fp)
+    except Exception:
+        raise ValueError("Unsupported format.")
+    if info.samplerate < 8000 or info.samplerate > 384000:
+        raise ValueError(f"Bad sample rate: {info.samplerate}Hz")
+    return {
+        "duration_sec": info.duration,
+        "sample_rate": info.samplerate,
+        "channels": info.channels,
+    }
 
 
-# ══════════════════════════════════════════
-# Whole Track Metrics Integration
-# ══════════════════════════════════════════
-def _compute_whole_track_metrics(
-  mono_signal: NDArray, left_channel: NDArray, right_channel: NDArray,
-  mid_signal: NDArray, side_signal: NDArray, left_k_weighted: NDArray,
-  right_k_weighted: NDArray, sample_rate: int, spectrum: TrackSpectrum,
-  circuit_envelopes: Dict[str, List[float]]
+def analyze_audio_file(fp: str) -> Dict[str, Any]:
+    """Main analysis entry point."""
+    data, sr = sf.read(fp, dtype="float64")
+    if data.ndim == 1:
+        data = np.column_stack([data, data])
+
+    left = data[:, 0]
+    right = data[:, 1]
+    mono = (left + right) * 0.5
+    side = (left - right) * 0.5
+
+    spec = TrackSpectrum.compute(mono, side, sr)
+    k_sos = _build_k_weight_sos(sr)
+    lk = sosfilt(k_sos, left)
+    rk = sosfilt(k_sos, right)
+    mk = (lk + rk) * 0.5
+
+    envs = _compute_envelopes(mono, mk, side, left, right, sr)
+    metrics = _compute_metrics(
+        mono, left, right, mono, side, lk, rk, sr, spec, envs
+    )
+    sections = _detect_sections(mono, sr, envs)
+
+    return {
+        "track_identity": {
+            "duration_sec": round(float(len(data) / sr), 2),
+            "sample_rate": sr,
+            "bpm": _estimate_bpm(mono, sr),
+            "key": _estimate_key(mono, sr),
+            "bit_depth": _detect_bit_depth(fp),
+        },
+        "whole_track_metrics": metrics,
+        "time_series_circuit_envelopes": envs,
+        "physical_sections": sections,
+        "detected_problems": _detect_problems(metrics),
+    }
+
+
+def _compute_envelopes(
+    mono: NDArray, mk: NDArray, side: NDArray,
+    left: NDArray, right: NDArray, sr: int,
 ) -> Dict[str, Any]:
+    """9-dimensional time-series envelopes."""
+    cs = int(sr * TIME_SERIES_RESOLUTION_SEC)
+    nc = len(mono) // cs
+    if nc == 0:
+        return {}
 
-  # BS.1770-4 Integrated Loudness
-  mean_k_power = np.mean(left_k_weighted ** 2) + np.mean(right_k_weighted ** 2)
-  integrated_lufs = -0.691 + 10.0 * np.log10(max(mean_k_power, LOG_FLOOR))
+    vl = nc * cs
+    m_ch = mono[:vl].reshape(nc, cs)
+    mk_ch = mk[:vl].reshape(nc, cs)
+    s_ch = side[:vl].reshape(nc, cs)
+    l_ch = left[:vl].reshape(nc, cs)
+    r_ch = right[:vl].reshape(nc, cs)
 
-  # True Peak Estimation (4x oversampling)
-  true_peak_value = _true_peak_estimate_chunked(left_channel, right_channel)
-  true_peak_dbtp = 20.0 * np.log10(max(true_peak_value, LOG_FLOOR))
+    msq = np.mean(mk_ch ** 2, axis=1) + LOG_FLOOR
+    lufs = -0.691 + 10.0 * np.log10(msq)
 
-  # BS.1770-4 LRA & Short-term Max (double-gated)
-  short_term_lufs_values = []
-  window_samples = int(3.0 * sample_rate)
-  hop_samples = int(1.0 * sample_rate)
+    rms = np.sqrt(np.mean(m_ch ** 2, axis=1) + LOG_FLOOR)
+    pk = np.max(np.abs(m_ch), axis=1)
+    crest = (
+        20.0 * np.log10(np.maximum(pk, LOG_FLOOR))
+        - 20.0 * np.log10(rms)
+    )
 
-  for start_idx in range(0, len(left_k_weighted) - window_samples, hop_samples):
-    end_idx = start_idx + window_samples
-    power_left = np.mean(left_k_weighted[start_idx:end_idx] ** 2)
-    power_right = np.mean(right_k_weighted[start_idx:end_idx] ** 2)
-    st_lufs = -0.691 + 10.0 * np.log10(max(power_left + power_right, LOG_FLOOR))
-    short_term_lufs_values.append(st_lufs)
+    srms = np.sqrt(np.mean(s_ch ** 2, axis=1) + LOG_FLOOR)
+    width = np.clip(srms / rms, 0.0, 1.0)
 
-  st_array = np.array(short_term_lufs_values)
-  absolute_threshold = -70.0
-  gated_st = st_array[st_array > absolute_threshold]
+    pwr = np.abs(np.fft.rfft(m_ch, axis=1)) ** 2
+    freqs = np.fft.rfftfreq(cs, 1.0 / sr)
+    te = np.sum(pwr[:, freqs >= 20], axis=1) + LOG_FLOOR
 
-  if len(gated_st) > 0:
-    relative_threshold = -0.691 + 10.0 * np.log10(max(np.mean(10 ** ((gated_st + 0.691) / 10.0)), LOG_FLOOR)) - 20.0
-    final_gated_st = gated_st[gated_st > relative_threshold]
+    sub_r = np.sum(
+        pwr[:, (freqs >= 20) & (freqs < 60)], axis=1
+    ) / te
+    bass_r = np.sum(
+        pwr[:, (freqs >= 60) & (freqs < 200)], axis=1
+    ) / te
+    voc_r = np.sum(
+        pwr[:, (freqs >= 1000) & (freqs < 5000)], axis=1
+    ) / te
+    wf = np.sum(pwr * freqs, axis=1)
+    bright = wf / te / (cs // 2)
 
-    if len(final_gated_st) > 2:
-      lra_lu = float(np.percentile(final_gated_st, 95) - np.percentile(final_gated_st, 10))
+    lp = butter(4, 120.0, btype="lowpass", fs=sr, output="sos")
+    ll = sosfilt(lp, l_ch, axis=1)
+    rl = sosfilt(lp, r_ch, axis=1)
+    llm = np.mean(ll, axis=1, keepdims=True)
+    rlm = np.mean(rl, axis=1, keepdims=True)
+    num = np.sum((ll - llm) * (rl - rlm), axis=1)
+    dl = np.sum((ll - llm) ** 2, axis=1)
+    dr = np.sum((rl - rlm) ** 2, axis=1)
+    den = np.sqrt(dl * dr) + LOG_FLOOR
+    lmc = np.clip(num / den, -1.0, 1.0)
+
+    tr = np.zeros(nc)
+    for i in range(nc):
+        tr[i] = float(np.percentile(np.abs(np.diff(m_ch[i])), 95))
+
+    def _r(a, d):
+        return [round(float(v), d) for v in a]
+
+    return {
+        "resolution_sec": TIME_SERIES_RESOLUTION_SEC,
+        "lufs": _r(lufs, 1),
+        "crest_db": _r(crest, 1),
+        "width": _r(width, 3),
+        "sub_ratio": _r(sub_r, 3),
+        "bass_ratio": _r(bass_r, 3),
+        "vocal_presence": _r(voc_r, 3),
+        "spectral_brightness": _r(bright, 4),
+        "low_mono_correlation": _r(lmc, 3),
+        "transient_sharpness": _r(tr, 6),
+    }
+
+
+def _compute_metrics(
+    mono: NDArray, left: NDArray, right: NDArray,
+    mid: NDArray, side: NDArray,
+    lk: NDArray, rk: NDArray,
+    sr: int, spec: TrackSpectrum,
+    envs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """BS.1770-4 whole-track metrics."""
+    mkp = np.mean(lk ** 2) + np.mean(rk ** 2)
+    i_lufs = -0.691 + 10.0 * np.log10(max(mkp, LOG_FLOOR))
+
+    tp_v = _true_peak_chunked(left, right)
+    tp_db = 20.0 * np.log10(max(tp_v, LOG_FLOOR))
+
+    st_vals = []
+    ws = int(3.0 * sr)
+    hs = int(1.0 * sr)
+    for si in range(0, len(lk) - ws, hs):
+        ei = si + ws
+        pl = np.mean(lk[si:ei] ** 2)
+        pr = np.mean(rk[si:ei] ** 2)
+        st = -0.691 + 10.0 * np.log10(max(pl + pr, LOG_FLOOR))
+        st_vals.append(st)
+
+    sta = np.array(st_vals)
+    gst = sta[sta > -70.0]
+
+    if len(gst) > 0:
+        mp = max(np.mean(10 ** ((gst + 0.691) / 10.0)), LOG_FLOOR)
+        rt = -0.691 + 10.0 * np.log10(mp) - 20.0
+        fg = gst[gst > rt]
+        lra = (
+            float(np.percentile(fg, 95) - np.percentile(fg, 10))
+            if len(fg) > 2 else 0.0
+        )
+        stm = float(np.max(gst))
     else:
-      lra_lu = 0.0
-    short_term_max = float(np.max(gated_st))
-  else:
-    lra_lu = 0.0
-    short_term_max = integrated_lufs
+        lra = 0.0
+        stm = i_lufs
 
-  psr_db = true_peak_dbtp - short_term_max
+    psr = tp_db - stm
 
-  # Band Energy Ratios (6-band split)
-  total_energy = np.sum(spectrum.mono_power[spectrum.freqs >= 20]) + LOG_FLOOR
-  ratios = {}
-  for band_name, (low_hz, high_hz) in BAND_EDGES.items():
-    if high_hz is None:
-      high_hz = np.inf
-    mask = (spectrum.freqs >= low_hz) & (spectrum.freqs < high_hz)
-    ratios[f"{band_name}_ratio"] = round(float(np.sum(spectrum.mono_power[mask]) / total_energy), 4)
+    te = np.sum(spec.mono_power[spec.freqs >= 20]) + LOG_FLOOR
+    ratios = {}
+    for bn, (lo, hi) in BAND_EDGES.items():
+        hi_v = hi if hi is not None else np.inf
+        mask = (spec.freqs >= lo) & (spec.freqs < hi_v)
+        ratios[f"{bn}_ratio"] = round(
+            float(np.sum(spec.mono_power[mask]) / te), 4
+        )
 
-  # Risks Analysis (harshness 2-6kHz, mud 200-500Hz)
-  harshness_mask = (spectrum.freqs >= 2000) & (spectrum.freqs < 6000)
-  harshness_energy = np.sum(spectrum.mono_power[harshness_mask])
-  harshness_risk = np.clip((harshness_energy / total_energy) * 3.0, 0.0, 1.0)
+    hm = (spec.freqs >= 2000) & (spec.freqs < 6000)
+    hr = np.clip(
+        (np.sum(spec.mono_power[hm]) / te) * 3.0, 0.0, 1.0
+    )
+    mr = np.clip(
+        (ratios.get("low_mid_ratio", 0.0) - 0.15) / 0.15,
+        0.0, 1.0,
+    )
 
-  low_mid_ratio = ratios.get("low_mid_ratio", 0.0)
-  mud_risk = np.clip((low_mid_ratio - 0.15) / 0.15, 0.0, 1.0)
+    m_rms = np.sqrt(np.mean(mono ** 2))
+    m_pk = np.max(np.abs(mono))
+    cdb = (
+        20.0 * np.log10(max(m_pk, LOG_FLOOR))
+        - 20.0 * np.log10(max(m_rms, LOG_FLOOR))
+    )
 
-  # Global Dynamics & Spatial Metrics
-  mono_rms = np.sqrt(np.mean(mono_signal ** 2))
-  mono_peak = np.max(np.abs(mono_signal))
-  crest_db = 20.0 * np.log10(max(mono_peak, LOG_FLOOR)) - 20.0 * np.log10(max(mono_rms, LOG_FLOOR))
+    s_rms = np.sqrt(np.mean(side ** 2))
+    mid_rms = np.sqrt(np.mean(mid ** 2))
+    sw = np.clip(s_rms / (mid_rms + LOG_FLOOR), 0.0, 1.0)
 
-  side_rms = np.sqrt(np.mean(side_signal ** 2))
-  mid_rms = np.sqrt(np.mean(mid_signal ** 2))
-  stereo_width = np.clip(side_rms / (mid_rms + LOG_FLOOR), 0.0, 1.0)
+    sc = np.corrcoef(left, right)[0, 1]
+    lmc = float(np.mean(envs.get("low_mono_correlation", [1.0])))
 
-  stereo_correlation = np.corrcoef(left_channel, right_channel)[0, 1]
-  low_mono_correlation = float(np.mean(circuit_envelopes.get("low_mono_correlation", [1.0])))
-
-  return {
-    "integrated_lufs": round(float(integrated_lufs), 1),
-    "true_peak_dbtp": round(float(true_peak_dbtp), 2),
-    "lra_lu": round(float(lra_lu), 1),
-    "psr_db": round(float(psr_db), 1),
-    "crest_db": round(float(crest_db), 1),
-    "stereo_width": round(float(stereo_width), 3),
-    "stereo_correlation": round(float(stereo_correlation), 3),
-    "low_mono_correlation_below_120hz": round(low_mono_correlation, 3),
-    "harshness_risk": round(float(harshness_risk), 3),
-    "mud_risk": round(float(mud_risk), 3),
-    **ratios
-  }
-
-
-def _true_peak_estimate_chunked(left_channel: NDArray, right_channel: NDArray) -> float:
-  """Chunked True Peak estimation to manage memory on long files."""
-  chunk_size = 44100 * 5 # 5 seconds
-  global_max_peak = max(np.max(np.abs(left_channel)), np.max(np.abs(right_channel)))
-
-  if global_max_peak < 1e-4:
-    return float(global_max_peak)
-
-  true_peak_max = 0.0
-  for start_idx in range(0, len(left_channel), chunk_size):
-    end_idx = start_idx + chunk_size
-    left_chunk = left_channel[start_idx:end_idx]
-    right_chunk = right_channel[start_idx:end_idx]
-
-    # Only upsample chunks where the peak is close to the global maximum
-    chunk_max = max(np.max(np.abs(left_chunk)), np.max(np.abs(right_chunk)))
-    if chunk_max > global_max_peak * 0.5:
-      left_oversampled = resample_poly(left_chunk, 4, 1)
-      right_oversampled = resample_poly(right_chunk, 4, 1)
-      true_peak_max = max(
-        true_peak_max,
-        np.max(np.abs(left_oversampled)),
-        np.max(np.abs(right_oversampled))
-      )
-
-  return float(max(true_peak_max, global_max_peak))
+    return {
+        "integrated_lufs": round(float(i_lufs), 1),
+        "true_peak_dbtp": round(float(tp_db), 2),
+        "lra_lu": round(float(lra), 1),
+        "psr_db": round(float(psr), 1),
+        "crest_db": round(float(cdb), 1),
+        "stereo_width": round(float(sw), 3),
+        "stereo_correlation": round(float(sc), 3),
+        "low_mono_correlation_below_120hz": round(lmc, 3),
+        "harshness_risk": round(float(hr), 3),
+        "mud_risk": round(float(mr), 3),
+        **ratios,
+    }
 
 
-# ══════════════════════════════════════════
-# Physical Section Boundaries & Meta Estimations
-# ══════════════════════════════════════════
-def _detect_physical_sections(total_samples: int, sample_rate: int, circuit_envelopes: Dict[str, Any]) -> List[Dict[str, Any]]:
-  """Identifies major energy and spatial shifts to define musical macro-form (sections)."""
-  lufs_envelope = np.array(circuit_envelopes.get("lufs", []))
-  width_envelope = np.array(circuit_envelopes.get("width", []))
+def _true_peak_chunked(left: NDArray, right: NDArray) -> float:
+    """Chunked 4x oversampled true peak."""
+    cs = 44100 * 5
+    gm = max(np.max(np.abs(left)), np.max(np.abs(right)))
+    if gm < 1e-4:
+        return float(gm)
 
-  if len(lufs_envelope) < 100:
-    return [{
-      "start_sec": 0.0,
-      "end_sec": float(total_samples / sample_rate),
-      "avg_lufs": round(float(np.mean(lufs_envelope)), 1) if len(lufs_envelope) > 0 else -14.0,
-      "avg_width": round(float(np.mean(width_envelope)), 3) if len(width_envelope) > 0 else 0.0
-    }]
-
-  # 1. Smooth to capture macro structure (3-second moving average)
-  smooth_window = int(3.0 / TIME_SERIES_RESOLUTION_SEC)
-  weights = np.ones(smooth_window) / smooth_window
-  smoothed_lufs = np.convolve(lufs_envelope, weights, mode='same')
-  smoothed_width = np.convolve(width_envelope, weights, mode='same')
-
-  # 2. Rate of change on smoothed signals
-  lufs_diff = np.abs(np.diff(smoothed_lufs))
-  width_diff = np.abs(np.diff(smoothed_width))
-
-  # 3. Normalize and blend LUFS + Width novelty (70/30 weight)
-  lufs_diff_norm = lufs_diff / (np.max(lufs_diff) + 1e-6)
-  width_diff_norm = width_diff / (np.max(width_diff) + 1e-6)
-  combined_novelty = lufs_diff_norm + (width_diff_norm * 0.3)
-
-  # 4. Peak-picking boundary detection
-  threshold = np.mean(combined_novelty) + 1.2 * np.std(combined_novelty)
-  boundaries = [0]
-  min_section_chunks = int(8.0 / TIME_SERIES_RESOLUTION_SEC)
-
-  for i in range(1, len(combined_novelty) - 1):
-    if (combined_novelty[i] > threshold and
-        combined_novelty[i] > combined_novelty[i-1] and
-        combined_novelty[i] > combined_novelty[i+1]):
-      if (i - boundaries[-1]) > min_section_chunks:
-        boundaries.append(i)
-
-  boundaries.append(len(lufs_envelope))
-
-  # 5. Build sections
-  sections = []
-  for idx in range(len(boundaries) - 1):
-    start_index = boundaries[idx]
-    end_index = boundaries[idx + 1]
-    sections.append({
-      "start_sec": float(start_index * TIME_SERIES_RESOLUTION_SEC),
-      "end_sec": float(end_index * TIME_SERIES_RESOLUTION_SEC),
-      "avg_lufs": round(float(np.mean(lufs_envelope[start_index:end_index])), 1),
-      "avg_width": round(float(np.mean(width_envelope[start_index:end_index])), 3)
-    })
-
-  return sections
+    tpm = 0.0
+    for si in range(0, len(left), cs):
+        ei = si + cs
+        lc = left[si:ei]
+        rc = right[si:ei]
+        cm = max(np.max(np.abs(lc)), np.max(np.abs(rc)))
+        if cm > gm * 0.5:
+            lo = resample_poly(lc, 4, 1)
+            ro = resample_poly(rc, 4, 1)
+            tpm = max(tpm, np.max(np.abs(lo)), np.max(np.abs(ro)))
+    return float(max(tpm, gm))
 
 
-def _estimate_bpm(mono_signal: NDArray, sample_rate: int) -> Optional[float]:
-  chunk_for_bpm = mono_signal  # Analyze full track for accurate BPM
-  frames = sliding_window_view(chunk_for_bpm, window_shape=1024)[::512]
+def _extract_context(
+    chunk: NDArray, sr: int,
+) -> Optional[Dict[str, Any]]:
+    """Gemini native multimodal audio context extraction."""
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None
 
-  if len(frames) == 0:
-    return None
+    genai.configure(api_key=api_key)
+    model_name = os.environ.get(
+        "GEMINI_MODEL", "gemini-2.5-flash-preview-05-20"
+    )
+    model = genai.GenerativeModel(model_name)
 
-  energy_onsets = np.maximum(np.diff(np.sum(frames ** 2, axis=1)), 0)
-  correlation = np.correlate(energy_onsets, energy_onsets, mode="full")[len(energy_onsets) - 1:]
+    with tempfile.NamedTemporaryFile(
+        suffix=".wav", delete=False
+    ) as tmp:
+        sf.write(tmp.name, chunk, sr)
+        tp = tmp.name
 
-  frames_per_second = sample_rate / 512.0
-  min_lag = int(frames_per_second * 60 / 200)
-  max_lag = int(frames_per_second * 60 / 60)
-
-  if max_lag > len(correlation) or len(correlation[min_lag:max_lag]) == 0:
-    return None
-
-  best_lag_index = np.argmax(correlation[min_lag:max_lag]) + min_lag
-  bpm = frames_per_second * 60.0 / best_lag_index
-  return round(float(bpm), 1)
-
-
-def _estimate_key(mono_signal: NDArray, sample_rate: int) -> Optional[str]:
-  chunk_for_key = mono_signal  # Analyze full track for accurate key detection
-  fft_result = np.abs(np.fft.rfft(chunk_for_key))
-  frequencies = np.fft.rfftfreq(len(chunk_for_key), 1.0 / sample_rate)
-
-  chroma_vector = np.zeros(12)
-  midi_notes = np.arange(24, 96)
-
-  for note in midi_notes:
-    target_frequency = A4_HZ * 2 ** ((note - 69) / 12)
-    closest_index = np.clip(np.searchsorted(frequencies, target_frequency), 0, len(frequencies) - 1)
-    chroma_vector[note % 12] += fft_result[closest_index] ** 2
-
-  best_correlation = -1.0
-  best_key = "C"
-  best_mode = "major"
-
-  for shift in range(12):
-    shifted_chroma = np.roll(chroma_vector, -shift)
-    correlation_major = np.corrcoef(shifted_chroma, MAJOR_PROFILE)[0, 1]
-    correlation_minor = np.corrcoef(shifted_chroma, MINOR_PROFILE)[0, 1]
-
-    if correlation_major > best_correlation:
-      best_correlation = correlation_major
-      best_key = NOTE_NAMES[shift]
-      best_mode = "major"
-
-    if correlation_minor > best_correlation:
-      best_correlation = correlation_minor
-      best_key = NOTE_NAMES[shift]
-      best_mode = "minor"
-
-  return f"{best_key} {best_mode}"
+    try:
+        af = genai.upload_file(path=tp)
+        prompt = (
+            "You are a mastering engineer. "
+            "Extract context from this audio "
+            "strictly into the JSON schema. "
+            "Be precise, no poetry."
+        )
+        resp = model.generate_content(
+            [prompt, af],
+            generation_config=GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=SectionSemanticContext,
+                temperature=0.0,
+            ),
+        )
+        genai.delete_file(af.name)
+        return json.loads(resp.text)
+    except Exception as e:
+        print(f"[WARN] Gemini failed: {e}")
+        return None
+    finally:
+        if os.path.exists(tp):
+            os.remove(tp)
 
 
-def _detect_problems(whole_metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
-  """Detect engineering issues based on audio metrics."""
-  detected_problems = []
+def _detect_sections(
+    mono: NDArray, sr: int, envs: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """DSP section detection + Gemini semantic context."""
+    lufs_e = np.array(envs.get("lufs", []))
+    width_e = np.array(envs.get("width", []))
 
-  # True Peak Danger (> -0.3 dBTP)
-  true_peak = whole_metrics.get("true_peak_dbtp", -100.0)
-  if true_peak > -0.3:
-    detected_problems.append({
-      "issue": "true_peak_danger",
-      "severity": "high",
-      "value": true_peak
-    })
+    if len(lufs_e) < 100:
+        return [{
+            "start_sec": 0.0,
+            "end_sec": float(len(mono) / sr),
+            "avg_lufs": round(float(np.mean(lufs_e)), 1)
+            if len(lufs_e) > 0 else -14.0,
+            "avg_width": round(float(np.mean(width_e)), 3)
+            if len(width_e) > 0 else 0.0,
+            "semantic_context": None,
+        }]
 
-  # Mud Risk (200-500Hz excess)
-  mud_risk = whole_metrics.get("mud_risk", 0.0)
-  if mud_risk > 0.4:
-    detected_problems.append({
-      "issue": "mud_risk",
-      "severity": "medium",
-      "value": mud_risk
-    })
+    sw = int(3.0 / TIME_SERIES_RESOLUTION_SEC)
+    w = np.ones(sw) / sw
+    sl = np.convolve(lufs_e, w, mode="same")
+    swi = np.convolve(width_e, w, mode="same")
 
-  # Phase Cancellation in Lows (< 120Hz)
-  low_mono_correlation = whole_metrics.get("low_mono_correlation_below_120hz", 1.0)
-  if low_mono_correlation < 0.3:
-    detected_problems.append({
-      "issue": "phase_cancellation_lows",
-      "severity": "medium",
-      "value": low_mono_correlation
-    })
+    ld = np.abs(np.diff(sl))
+    wd = np.abs(np.diff(swi))
+    ln = ld / (np.max(ld) + 1e-6)
+    wn = wd / (np.max(wd) + 1e-6)
+    nov = ln + (wn * 0.3)
 
-  # Harshness in 2-6kHz
-  harshness_risk = whole_metrics.get("harshness_risk", 0.0)
-  if harshness_risk > 0.5:
-    detected_problems.append({
-      "issue": "harshness_risk",
-      "severity": "medium",
-      "value": harshness_risk
-    })
+    th = np.mean(nov) + 1.2 * np.std(nov)
+    bounds = [0]
+    mc = int(8.0 / TIME_SERIES_RESOLUTION_SEC)
 
-  # Crest Factor observation (informational, not a problem)
-  crest_db = whole_metrics.get("crest_db", 20.0)
-  if crest_db < 3.0:
-    detected_problems.append({
-      "issue": "extremely_low_crest_factor",
-      "severity": "low",
-      "value": crest_db
-    })
+    for i in range(1, len(nov) - 1):
+        if (
+            nov[i] > th
+            and nov[i] > nov[i - 1]
+            and nov[i] > nov[i + 1]
+        ):
+            if (i - bounds[-1]) > mc:
+                bounds.append(i)
 
-  return detected_problems
+    bounds.append(len(lufs_e))
+    secs = []
+
+    for idx in range(len(bounds) - 1):
+        si = bounds[idx]
+        ei = bounds[idx + 1]
+        ss = float(si * TIME_SERIES_RESOLUTION_SEC)
+        es = float(ei * TIME_SERIES_RESOLUTION_SEC)
+        s_samp = int(ss * sr)
+        e_samp = int(es * sr)
+        chunk = mono[s_samp:e_samp]
+
+        ctx = _extract_context(chunk, sr)
+
+        secs.append({
+            "section_id": f"SEC_{idx}",
+            "start_sec": ss,
+            "end_sec": es,
+            "avg_lufs": round(
+                float(np.mean(lufs_e[si:ei])), 1
+            ),
+            "avg_width": round(
+                float(np.mean(width_e[si:ei])), 3
+            ),
+            "semantic_context": ctx,
+        })
+
+    return secs
 
 
-def _detect_bit_depth(file_path: str) -> int:
-  try:
-    with open(file_path, "rb") as f:
-      header = f.read(40)
-    if len(header) >= 36 and header[:4] == b"RIFF":
-      return struct.unpack_from("<H", header, 34)[0]
-  except Exception:
-    pass
-  return 24
+def _estimate_bpm(mono: NDArray, sr: int) -> Optional[float]:
+    """Full-track BPM estimation."""
+    frames = sliding_window_view(mono, window_shape=1024)[::512]
+    if len(frames) == 0:
+        return None
+    onsets = np.maximum(np.diff(np.sum(frames ** 2, axis=1)), 0)
+    corr = np.correlate(onsets, onsets, mode="full")
+    corr = corr[len(onsets) - 1:]
+    fps = sr / 512.0
+    lo = int(fps * 60 / 200)
+    hi = int(fps * 60 / 60)
+    if hi > len(corr) or len(corr[lo:hi]) == 0:
+        return None
+    bl = np.argmax(corr[lo:hi]) + lo
+    return round(float(fps * 60.0 / bl), 1)
 
+
+def _estimate_key(mono: NDArray, sr: int) -> Optional[str]:
+    """Full-track key detection."""
+    fft_r = np.abs(np.fft.rfft(mono))
+    freqs = np.fft.rfftfreq(len(mono), 1.0 / sr)
+    chroma = np.zeros(12)
+    for note in np.arange(24, 96):
+        tf = A4_HZ * 2 ** ((note - 69) / 12)
+        idx = np.clip(
+            np.searchsorted(freqs, tf), 0, len(freqs) - 1
+        )
+        chroma[note % 12] += fft_r[idx] ** 2
+
+    bc, bk, bm = -1.0, "C", "major"
+    for shift in range(12):
+        sc = np.roll(chroma, -shift)
+        cm = np.corrcoef(sc, MAJOR_PROFILE)[0, 1]
+        cn = np.corrcoef(sc, MINOR_PROFILE)[0, 1]
+        if cm > bc:
+            bc, bk, bm = cm, NOTE_NAMES[shift], "major"
+        if cn > bc:
+            bc, bk, bm = cn, NOTE_NAMES[shift], "minor"
+    return f"{bk} {bm}"
+
+
+def _detect_problems(
+    wm: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Detect engineering issues."""
+    p = []
+    if wm.get("true_peak_dbtp", -100.0) > -0.3:
+        p.append({
+            "issue": "true_peak_danger",
+            "severity": "high",
+            "value": wm["true_peak_dbtp"],
+        })
+    if wm.get("mud_risk", 0.0) > 0.4:
+        p.append({
+            "issue": "mud_risk",
+            "severity": "medium",
+            "value": wm["mud_risk"],
+        })
+    if wm.get("low_mono_correlation_below_120hz", 1.0) < 0.3:
+        p.append({
+            "issue": "phase_cancellation_lows",
+            "severity": "medium",
+            "value": wm["low_mono_correlation_below_120hz"],
+        })
+    if wm.get("harshness_risk", 0.0) > 0.5:
+        p.append({
+            "issue": "harshness_risk",
+            "severity": "medium",
+            "value": wm["harshness_risk"],
+        })
+    if wm.get("crest_db", 20.0) < 3.0:
+        p.append({
+            "issue": "extremely_low_crest_factor",
+            "severity": "low",
+            "value": wm["crest_db"],
+        })
+    return p
+
+
+def _detect_bit_depth(fp: str) -> int:
+    """Detect WAV bit depth from RIFF header."""
+    try:
+        with open(fp, "rb") as f:
+            h = f.read(40)
+        if len(h) >= 36 and h[:4] == b"RIFF":
+            return struct.unpack_from("<H", h, 34)[0]
+    except Exception:
+        pass
+    return 24
 
 
 if __name__ == "__main__":
-  import json
-  import sys
+    import sys
 
-  if len(sys.argv) < 2:
-    print("Usage: python audio_analysis.py <audio_file> [--validate-only]")
-    print("")
-    print("Examples:")
-    print("  python audio_analysis.py master.wav")
-    print("  python audio_analysis.py master.flac --validate-only")
-    sys.exit(1)
+    if len(sys.argv) < 2:
+        print("Usage: python audio_analysis.py <file>")
+        sys.exit(1)
 
-  audio_file_path = sys.argv[1]
-  validate_only = "--validate-only" in sys.argv
+    path = sys.argv[1]
+    if "--validate-only" in sys.argv:
+        print(validate_audio_file(path))
+        sys.exit(0)
 
-  # Step 1: Validation (always runs first)
-  validation_result = validate_audio_file(audio_file_path)
-  print(f"[VALIDATION] Duration: {validation_result['duration_sec']:.1f}s | "
-     f"Sample Rate: {validation_result['sample_rate']}Hz | "
-     f"Channels: {validation_result['channels']}")
+    if not (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    ):
+        print("[NOTICE] No Gemini key. DSP-only mode.")
 
-  if validate_only:
-    print("[DONE] Validation only. No analysis performed.")
-    sys.exit(0)
-
-  # Step 2: Full Analysis
-  print("[ANALYSIS] Computing Time-Series Circuit Envelopes...")
-  analysis_result = analyze_audio_file(audio_file_path)
-
-  # Step 3: Human-readable summary
-  metrics = analysis_result["whole_track_metrics"]
-  identity = analysis_result["track_identity"]
-  envelopes = analysis_result["time_series_circuit_envelopes"]
-  problems = analysis_result["detected_problems"]
-  sections = analysis_result["physical_sections"]
-
-  print(f"[IDENTITY] BPM: {identity['bpm']} | Key: {identity['key']} | "
-     f"Bit Depth: {identity['bit_depth']}bit")
-  print(f"[METRICS]  LUFS: {metrics['integrated_lufs']} | "
-     f"TP: {metrics['true_peak_dbtp']} dBTP | "
-     f"LRA: {metrics['lra_lu']} LU | "
-     f"PSR: {metrics['psr_db']} dB | "
-     f"Crest: {metrics['crest_db']} dB")
-  print(f"[SPATIAL]  Width: {metrics['stereo_width']} | "
-     f"Correlation: {metrics['stereo_correlation']} | "
-     f"Low Mono: {metrics['low_mono_correlation_below_120hz']}")
-  print(f"[RISK]   Harshness: {metrics['harshness_risk']} | "
-     f"Mud: {metrics['mud_risk']}")
-  print(f"[CIRCUIT] {len(envelopes.get('lufs', []))} chunks x "
-     f"9 dimensions @ {envelopes.get('resolution_sec', 1.0)}s resolution")
-  print(f"[SECTIONS] {len(sections)} physical sections detected")
-
-  if problems:
-    for problem in problems:
-      print(f"[PROBLEM] {problem['issue']} ({problem['severity']}): {problem['value']}")
-  else:
-    print("[PROBLEM] None detected.")
-
-  # Step 4: Full JSON output (pipeable to file or next stage)
-  print("---JSON_START---")
-  print(json.dumps(analysis_result, indent=2, ensure_ascii=False))
-  print("---JSON_END---")
+    result = analyze_audio_file(path)
+    print(json.dumps(result, indent=2, ensure_ascii=False))

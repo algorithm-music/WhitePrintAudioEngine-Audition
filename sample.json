@@ -1,0 +1,108 @@
+{
+  "track_identity": {
+    "duration_sec": 283.32,
+    "sample_rate": 48000,
+    "bpm": 69.4,
+    "key": "F# minor",
+    "bit_depth": 24
+  },
+  "whole_track_metrics": {
+    "integrated_lufs": -11.6,
+    "true_peak_dbtp": -4.16,
+    "lra_lu": 4.1,
+    "psr_db": 4.6,
+    "crest_db": 9.3,
+    "stereo_width": 0.12,
+    "stereo_correlation": 0.973,
+    "low_mono_correlation_below_120hz": 0.968,
+    "harshness_risk": 0.05,
+    "mud_risk": 0.0,
+    "sub_ratio": 0.4523,
+    "bass_ratio": 0.4515,
+    "low_mid_ratio": 0.0381,
+    "mid_ratio": 0.0319,
+    "high_ratio": 0.0207,
+    "air_ratio": 0.0055
+  },
+  "time_series_circuit_envelopes": {
+    "resolution_sec": 0.1,
+    "lufs": [-15.9, -15.8, -15.8, -15.9, -16.0],
+    "crest_db": [6.7, 6.8, 6.7, 6.9, 7.0],
+    "width": [0.053, 0.054, 0.053, 0.055, 0.058],
+    "sub_ratio": [0.296, 0.301, 0.312, 0.285, 0.290],
+    "bass_ratio": [0.622, 0.615, 0.601, 0.630, 0.620],
+    "vocal_presence": [0.021, 0.022, 0.020, 0.021, 0.023],
+    "spectral_brightness": [0.863, 0.850, 0.871, 0.860, 0.865],
+    "low_mono_correlation": [0.980, 0.981, 0.985, 0.979, 0.980],
+    "transient_sharpness": [0.021, 0.025, 0.018, 0.030, 0.022]
+  },
+  "physical_sections": [
+    {
+      "section_id": "SEC_0",
+      "start_sec": 0.0,
+      "end_sec": 43.5,
+      "avg_lufs": -15.9,
+      "avg_width": 0.053,
+      "semantic_context": {
+        "primary_instruments": [
+          "Dark Synthesizer Pad",
+          "Vinyl Crackle Noise"
+        ],
+        "musical_scene": "静かで重苦しい空気感を持つイントロダクション",
+        "genre_foundation": "Dark Ambient / Cinematic",
+        "rhythmic_density": "ビートが存在しない、非常に疎（Sparse）な状態"
+      }
+    },
+    {
+      "section_id": "SEC_1",
+      "start_sec": 43.5,
+      "end_sec": 125.2,
+      "avg_lufs": -15.3,
+      "avg_width": 0.089,
+      "semantic_context": {
+        "primary_instruments": [
+          "Deep 808 Sub Bass (Sustained)",
+          "Programmed Trap Hi-Hats",
+          "Rimshot Snare"
+        ],
+        "musical_scene": "重厚な低音が支配し、トラップビートが刻まれるメインのグルーヴセクション",
+        "genre_foundation": "Trap / Bass Music",
+        "rhythmic_density": "16分音符のハイハットによる中程度の密度（Moderate）"
+      }
+    },
+    {
+      "section_id": "SEC_2",
+      "start_sec": 125.2,
+      "end_sec": 133.9,
+      "avg_lufs": -14.0,
+      "avg_width": 0.048,
+      "semantic_context": {
+        "primary_instruments": [
+          "Aggressive 808 Kick / Bass",
+          "Rapid Hi-Hat Rolls",
+          "Distorted Brass Hit"
+        ],
+        "musical_scene": "楽曲のピーク（ドロップ）。全てのエネルギーが中央に集中し、強烈なアタック感を持つ",
+        "genre_foundation": "Heavy Trap",
+        "rhythmic_density": "音数が詰まった非常に密（Dense）でアグレッシブな状態"
+      }
+    },
+    {
+      "section_id": "SEC_3",
+      "start_sec": 133.9,
+      "end_sec": 283.32,
+      "avg_lufs": -16.9,
+      "avg_width": 0.158,
+      "semantic_context": {
+        "primary_instruments": [
+          "Filtered Synthesizer Pad",
+          "Reverb Tails"
+        ],
+        "musical_scene": "ビートが消え、余韻だけがステレオ空間に広がっていくアウトロ",
+        "genre_foundation": "Ambient",
+        "rhythmic_density": "リズム要素なし（None）"
+      }
+    }
+  ],
+  "detected_problems": []
+}
