@@ -14,6 +14,6 @@ python-multipart>=0.0.9,<1.0
 # HTTP client (URL-based audio fetch)
 httpx>=0.27,<1.0
 
-# Gemini Multimodal (native audio context extraction)
-google-generativeai>=0.8,<1.0
+# Gemini Multimodal via Vertex AI (native audio context extraction)
+google-genai>=1.14,<2.0
 typing_extensions>=4.0

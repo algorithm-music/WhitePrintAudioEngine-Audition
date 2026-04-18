@@ -42,10 +42,12 @@ logger = logging.getLogger("audition")
 async def lifespan(application: FastAPI):
     logger.info("Audition service is online.")
     logger.info("Audio analysis engine ready.")
-    if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
-        logger.info("Semantic Extraction (Gemini) is ENABLED.")
+    if os.environ.get("GOOGLE_CLOUD_PROJECT"):
+        logger.info("Semantic Extraction (Vertex AI Gemini) is ENABLED.")
+    elif os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+        logger.info("Semantic Extraction (Gemini API) is ENABLED.")
     else:
-        logger.warning("No Gemini key. Semantic Extraction DISABLED.")
+        logger.warning("No Gemini credentials. Semantic Extraction DISABLED.")
     logger.info("Audio files will NOT be stored.")
     yield
     logger.info("Audition service shutting down.")

@@ -9,14 +9,15 @@ import json
 import os
 import struct
 import tempfile
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import google.generativeai as genai
 import numpy as np
 import soundfile as sf
 import typing_extensions as typing
-from google.generativeai.types import GenerationConfig
+from google import genai
+from google.genai import types as genai_types
 from numpy.lib.stride_tricks import sliding_window_view
 from numpy.typing import NDArray
 from scipy.signal import butter, resample_poly, sosfilt
@@ -129,7 +130,7 @@ def validate_audio_file(fp: str) -> Dict[str, Any]:
 
 def analyze_audio_file(fp: str) -> Dict[str, Any]:
     """Main analysis entry point."""
-    data, sr = sf.read(fp, dtype="float64")
+    data, sr = sf.read(fp, dtype="float32")
     if data.ndim == 1:
         data = np.column_stack([data, data])
 
@@ -355,32 +356,37 @@ def _true_peak_chunked(left: NDArray, right: NDArray) -> float:
 def _extract_macro_form(
     mono: NDArray, sr: int, duration: float,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Listen to full track once with Gemini, get sections + semantics."""
-    api_key = (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-    )
-    if not api_key:
+    """Listen to full track once with Gemini on Vertex AI, get sections + semantics.
+
+    Uses GCSFuse mount to stream audio to GCS, then passes gs:// URI to Vertex
+    (avoids loading audio into Python process memory).
+    """
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
+    gcs_mount = os.environ.get("GCSFUSE_MOUNT", "/mnt/gcs/aimastering-tmp-audio")
+    gcs_bucket = os.environ.get("GCSFUSE_BUCKET", "aidriven-mastering-fyqu-source-bucket")
+    if not project:
+        print("[WARN] GOOGLE_CLOUD_PROJECT not set; skipping Gemini extraction.")
+        return None
+    if not os.path.isdir(gcs_mount):
+        print(f"[WARN] GCSFuse mount missing at {gcs_mount}; skipping Gemini extraction.")
         return None
 
-    genai.configure(api_key=api_key)
-    model_name = os.environ.get(
-        "GEMINI_MODEL", "gemini-2.5-flash-preview-05-20"
-    )
-    model = genai.GenerativeModel(model_name)
+    client = genai.Client(vertexai=True, project=project, location=location)
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
     # Downsample to 16kHz mono for fast upload
     target_sr = 16000
     down = resample_poly(mono, target_sr, sr)
 
-    with tempfile.NamedTemporaryFile(
-        suffix=".wav", delete=False
-    ) as tmp:
-        sf.write(tmp.name, down, target_sr)
-        tp = tmp.name
+    object_name = f"vertex-audio-{uuid.uuid4().hex}.wav"
+    fuse_path = os.path.join(gcs_mount, object_name)
+    gs_uri = f"gs://{gcs_bucket}/{object_name}"
 
     try:
-        af = genai.upload_file(path=tp)
+        # Writing through the GCSFuse mount streams to GCS without buffering in memory.
+        sf.write(fuse_path, down, target_sr)
+
         prompt = (
             f"Listen to this track ({duration:.1f}s). "
             "Divide it into main musical sections "
@@ -391,23 +397,31 @@ def _extract_macro_form(
             "3. No section shorter than 15 seconds. "
             "4. Be objective and precise."
         )
-        resp = model.generate_content(
-            [prompt, af],
-            generation_config=GenerationConfig(
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=[
+                prompt,
+                genai_types.Part.from_uri(
+                    file_uri=gs_uri, mime_type="audio/wav"
+                ),
+            ],
+            config=genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=MacroFormResponse,
                 temperature=0.0,
             ),
         )
-        genai.delete_file(af.name)
         result = json.loads(resp.text)
         return result.get("sections", [])
     except Exception as e:
         print(f"[WARN] Gemini macro-form failed: {e}")
         return None
     finally:
-        if os.path.exists(tp):
-            os.remove(tp)
+        try:
+            if os.path.exists(fuse_path):
+                os.remove(fuse_path)
+        except Exception:
+            pass
 
 
 def _detect_sections(
@@ -629,10 +643,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if not (
-        os.environ.get("GEMINI_API_KEY")
+        os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or os.environ.get("GEMINI_API_KEY")
         or os.environ.get("GOOGLE_API_KEY")
     ):
-        print("[NOTICE] No Gemini key. DSP-only mode.")
+        print("[NOTICE] No Gemini credentials. DSP-only mode.")
 
     result = analyze_audio_file(path)
     print(json.dumps(result, indent=2, ensure_ascii=False))
