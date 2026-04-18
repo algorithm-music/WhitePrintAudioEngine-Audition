@@ -5,6 +5,7 @@
 Performs BS.1770-4 compliant audio analysis with Gemini semantic extraction.
 """
 
+import gc
 import json
 import os
 import struct
@@ -64,9 +65,21 @@ class TrackSpectrum:
         side: NDArray[np.float64],
         sr: int,
     ) -> "TrackSpectrum":
-        mp = np.abs(np.fft.rfft(mono)) ** 2
-        sp = np.abs(np.fft.rfft(side)) ** 2
-        f = np.fft.rfftfreq(len(mono), 1.0 / sr)
+        # Compute FFT power spectra as float32 to halve peak memory
+        # (rfft defaults to complex128; |.|**2 would be float64).
+        mf = np.fft.rfft(mono)
+        mp = (mf.real * mf.real + mf.imag * mf.imag).astype(
+            np.float32, copy=False
+        )
+        del mf
+        sf_ = np.fft.rfft(side)
+        sp = (sf_.real * sf_.real + sf_.imag * sf_.imag).astype(
+            np.float32, copy=False
+        )
+        del sf_
+        f = np.fft.rfftfreq(len(mono), 1.0 / sr).astype(
+            np.float32, copy=False
+        )
         return cls(f, mp, sp)
 
 
@@ -132,32 +145,49 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
     """Main analysis entry point."""
     data, sr = sf.read(fp, dtype="float32")
     if data.ndim == 1:
-        data = np.column_stack([data, data])
+        left = np.ascontiguousarray(data, dtype=np.float32)
+        right = left
+    else:
+        left = np.ascontiguousarray(data[:, 0], dtype=np.float32)
+        right = np.ascontiguousarray(data[:, 1], dtype=np.float32)
+    duration_sec = round(float(len(left) / sr), 2)
+    del data
+    gc.collect()
 
-    left = data[:, 0]
-    right = data[:, 1]
-    mono = (left + right) * 0.5
-    side = (left - right) * 0.5
+    mono = ((left + right) * 0.5).astype(np.float32, copy=False)
+    side = ((left - right) * 0.5).astype(np.float32, copy=False)
 
     spec = TrackSpectrum.compute(mono, side, sr)
     k_sos = _build_k_weight_sos(sr)
-    lk = sosfilt(k_sos, left)
-    rk = sosfilt(k_sos, right)
-    mk = (lk + rk) * 0.5
+    lk = sosfilt(k_sos, left).astype(np.float32, copy=False)
+    rk = sosfilt(k_sos, right).astype(np.float32, copy=False)
+    mk = ((lk + rk) * 0.5).astype(np.float32, copy=False)
+    gc.collect()
 
     envs = _compute_envelopes(mono, mk, side, left, right, sr)
+    del mk
+    gc.collect()
+
     metrics = _compute_metrics(
         mono, left, right, mono, side, lk, rk, sr, spec, envs
     )
+    # lk, rk, spec no longer needed past this point.
+    del lk, rk, spec
+    gc.collect()
+
+    bpm = _estimate_bpm(mono, sr)
+    key = _estimate_key(mono, sr)
+    bit_depth = _detect_bit_depth(fp)
+
     sections = _detect_sections(mono, sr, envs)
 
     return {
         "track_identity": {
-            "duration_sec": round(float(len(data) / sr), 2),
+            "duration_sec": duration_sec,
             "sample_rate": sr,
-            "bpm": _estimate_bpm(mono, sr),
-            "key": _estimate_key(mono, sr),
-            "bit_depth": _detect_bit_depth(fp),
+            "bpm": bpm,
+            "key": key,
+            "bit_depth": bit_depth,
         },
         "whole_track_metrics": metrics,
         "time_series_circuit_envelopes": envs,
@@ -213,15 +243,22 @@ def _compute_envelopes(
     bright = wf / te / (cs // 2)
 
     lp = butter(4, 120.0, btype="lowpass", fs=sr, output="sos")
-    ll = sosfilt(lp, l_ch, axis=1)
-    rl = sosfilt(lp, r_ch, axis=1)
+    ll = sosfilt(lp, l_ch, axis=1).astype(np.float32, copy=False)
+    rl = sosfilt(lp, r_ch, axis=1).astype(np.float32, copy=False)
     llm = np.mean(ll, axis=1, keepdims=True)
     rlm = np.mean(rl, axis=1, keepdims=True)
-    num = np.sum((ll - llm) * (rl - rlm), axis=1)
-    dl = np.sum((ll - llm) ** 2, axis=1)
-    dr = np.sum((rl - rlm) ** 2, axis=1)
+    # Center in place, free the mean offsets, and compute sums via einsum
+    # to avoid materializing (ll-llm)**2 and (rl-rlm)**2 full arrays.
+    ll -= llm
+    rl -= rlm
+    del llm, rlm
+    num = np.einsum("ij,ij->i", ll, rl)
+    dl = np.einsum("ij,ij->i", ll, ll)
+    dr = np.einsum("ij,ij->i", rl, rl)
+    del ll, rl
     den = np.sqrt(dl * dr) + LOG_FLOOR
     lmc = np.clip(num / den, -1.0, 1.0)
+    del num, dl, dr, den
 
     tr = np.zeros(nc)
     for i in range(nc):
@@ -252,7 +289,11 @@ def _compute_metrics(
     envs: Dict[str, Any],
 ) -> Dict[str, Any]:
     """BS.1770-4 whole-track metrics."""
-    mkp = np.mean(lk ** 2) + np.mean(rk ** 2)
+    # einsum computes sum-of-squares without materializing lk**2 / rk**2.
+    mkp = (
+        float(np.einsum("i,i->", lk, lk)) / len(lk)
+        + float(np.einsum("i,i->", rk, rk)) / len(rk)
+    )
     i_lufs = -0.691 + 10.0 * np.log10(max(mkp, LOG_FLOOR))
 
     tp_v = _true_peak_chunked(left, right)
@@ -540,13 +581,29 @@ def _dsp_fallback(
 
 
 def _estimate_bpm(mono: NDArray, sr: int) -> Optional[float]:
-    """Full-track BPM estimation."""
+    """Full-track BPM estimation.
+
+    Uses a chunked einsum to compute per-frame energy without materializing
+    the (n_frames, 1024) squared-frame array, which would be hundreds of MB
+    for a multi-minute track.
+    """
     frames = sliding_window_view(mono, window_shape=1024)[::512]
-    if len(frames) == 0:
+    n_frames = len(frames)
+    if n_frames == 0:
         return None
-    onsets = np.maximum(np.diff(np.sum(frames ** 2, axis=1)), 0)
+    energy = np.empty(n_frames, dtype=np.float32)
+    chunk = 8192
+    for i in range(0, n_frames, chunk):
+        end = min(i + chunk, n_frames)
+        blk = frames[i:end]
+        energy[i:end] = np.einsum("ij,ij->i", blk, blk).astype(
+            np.float32, copy=False
+        )
+    onsets = np.maximum(np.diff(energy), 0)
+    del energy
     corr = np.correlate(onsets, onsets, mode="full")
     corr = corr[len(onsets) - 1:]
+    del onsets
     fps = sr / 512.0
     lo = int(fps * 60 / 200)
     hi = int(fps * 60 / 60)
@@ -558,15 +615,26 @@ def _estimate_bpm(mono: NDArray, sr: int) -> Optional[float]:
 
 def _estimate_key(mono: NDArray, sr: int) -> Optional[str]:
     """Full-track key detection."""
-    fft_r = np.abs(np.fft.rfft(mono))
-    freqs = np.fft.rfftfreq(len(mono), 1.0 / sr)
+    # Compute magnitude spectrum as float32 to match TrackSpectrum path.
+    mf = np.fft.rfft(mono)
+    fft_r = np.sqrt(
+        (mf.real * mf.real + mf.imag * mf.imag).astype(
+            np.float32, copy=False
+        )
+    )
+    del mf
+    freqs = np.fft.rfftfreq(len(mono), 1.0 / sr).astype(
+        np.float32, copy=False
+    )
     chroma = np.zeros(12)
     for note in np.arange(24, 96):
         tf = A4_HZ * 2 ** ((note - 69) / 12)
-        idx = np.clip(
+        idx = int(np.clip(
             np.searchsorted(freqs, tf), 0, len(freqs) - 1
-        )
-        chroma[note % 12] += fft_r[idx] ** 2
+        ))
+        chroma[note % 12] += float(fft_r[idx]) ** 2
+    del fft_r, freqs
+    gc.collect()
 
     bc, bk, bm = -1.0, "C", "major"
     for shift in range(12):
