@@ -141,6 +141,29 @@ def validate_audio_file(fp: str) -> Dict[str, Any]:
     }
 
 
+def _fuse_path_to_gs_uri(fp: str) -> Optional[str]:
+    """If `fp` is under the GCSFuse mount, return the corresponding gs:// URI.
+
+    This lets us hand the original audio to Vertex by reference, with no
+    re-upload and no intermediate downsample. Returns None if the path is
+    outside the mount (e.g. /tmp fallback), so the caller falls back to the
+    write-downsampled-copy path.
+    """
+    gcs_mount = os.environ.get("GCSFUSE_MOUNT", "/mnt/gcs/aimastering-tmp-audio")
+    gcs_bucket = os.environ.get("GCSFUSE_BUCKET", "aidriven-mastering-fyqu-source-bucket")
+    try:
+        abs_fp = os.path.abspath(fp)
+        abs_mount = os.path.abspath(gcs_mount).rstrip("/") + "/"
+        if abs_fp.startswith(abs_mount):
+            rel = abs_fp[len(abs_mount):]
+            # GCS object names use forward slashes regardless of OS.
+            rel = rel.replace(os.sep, "/")
+            return f"gs://{gcs_bucket}/{rel}"
+    except Exception:
+        pass
+    return None
+
+
 def analyze_audio_file(fp: str) -> Dict[str, Any]:
     """Main analysis entry point."""
     data, sr = sf.read(fp, dtype="float32")
@@ -179,7 +202,11 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
     key = _estimate_key(mono, sr)
     bit_depth = _detect_bit_depth(fp)
 
-    sections = _detect_sections(mono, sr, envs)
+    # If the input file lives on the GCSFuse mount, Vertex can read it in
+    # place; otherwise _extract_macro_form falls back to writing a 16 kHz
+    # downsample.
+    input_gs_uri = _fuse_path_to_gs_uri(fp)
+    sections = _detect_sections(mono, sr, envs, input_gs_uri=input_gs_uri)
 
     return {
         "track_identity": {
@@ -396,11 +423,14 @@ def _true_peak_chunked(left: NDArray, right: NDArray) -> float:
 
 def _extract_macro_form(
     mono: NDArray, sr: int, duration: float,
+    input_gs_uri: Optional[str] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """Listen to full track once with Gemini on Vertex AI, get sections + semantics.
 
-    Uses GCSFuse mount to stream audio to GCS, then passes gs:// URI to Vertex
-    (avoids loading audio into Python process memory).
+    If `input_gs_uri` is provided (i.e. the caller already has the audio on
+    Cloud Storage, e.g. via the GCSFuse mount), pass that URI directly to
+    Vertex — no downsample, no re-write. Otherwise write a 16 kHz mono
+    downsample to the GCSFuse mount and use that gs:// URI.
     """
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
@@ -409,24 +439,29 @@ def _extract_macro_form(
     if not project:
         print("[WARN] GOOGLE_CLOUD_PROJECT not set; skipping Gemini extraction.")
         return None
-    if not os.path.isdir(gcs_mount):
-        print(f"[WARN] GCSFuse mount missing at {gcs_mount}; skipping Gemini extraction.")
-        return None
 
     client = genai.Client(vertexai=True, project=project, location=location)
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-    # Downsample to 16kHz mono for fast upload
-    target_sr = 16000
-    down = resample_poly(mono, target_sr, sr)
-
-    object_name = f"vertex-audio-{uuid.uuid4().hex}.wav"
-    fuse_path = os.path.join(gcs_mount, object_name)
-    gs_uri = f"gs://{gcs_bucket}/{object_name}"
+    # Fast path: input already on GCS — Vertex reads it in place.
+    if input_gs_uri is not None:
+        gs_uri = input_gs_uri
+        fuse_path = None
+    else:
+        if not os.path.isdir(gcs_mount):
+            print(f"[WARN] GCSFuse mount missing at {gcs_mount}; skipping Gemini extraction.")
+            return None
+        # Downsample to 16 kHz mono and write it through the FUSE mount.
+        target_sr = 16000
+        down = resample_poly(mono, target_sr, sr)
+        object_name = f"vertex-audio-{uuid.uuid4().hex}.wav"
+        fuse_path = os.path.join(gcs_mount, object_name)
+        gs_uri = f"gs://{gcs_bucket}/{object_name}"
 
     try:
-        # Writing through the GCSFuse mount streams to GCS without buffering in memory.
-        sf.write(fuse_path, down, target_sr)
+        if fuse_path is not None:
+            # Writing through the GCSFuse mount streams to GCS without buffering.
+            sf.write(fuse_path, down, target_sr)
 
         prompt = (
             f"Listen to this track ({duration:.1f}s). "
@@ -458,8 +493,9 @@ def _extract_macro_form(
         print(f"[WARN] Gemini macro-form failed: {e}")
         return None
     finally:
+        # Only remove our own downsampled copy; never touch the caller's input file.
         try:
-            if os.path.exists(fuse_path):
+            if fuse_path is not None and os.path.exists(fuse_path):
                 os.remove(fuse_path)
         except Exception:
             pass
@@ -467,6 +503,7 @@ def _extract_macro_form(
 
 def _detect_sections(
     mono: NDArray, sr: int, envs: Dict[str, Any],
+    input_gs_uri: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """AI-driven segmentation with DSP fallback."""
     lufs_e = np.array(envs.get("lufs", []))
@@ -475,7 +512,7 @@ def _detect_sections(
     res = TIME_SERIES_RESOLUTION_SEC
 
     # 1. Try Gemini (1 API call for entire track)
-    ai_secs = _extract_macro_form(mono, sr, duration)
+    ai_secs = _extract_macro_form(mono, sr, duration, input_gs_uri=input_gs_uri)
 
     if ai_secs and len(ai_secs) > 0:
         sections = []
