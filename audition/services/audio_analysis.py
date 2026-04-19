@@ -7,6 +7,7 @@ Performs BS.1770-4 compliant audio analysis with Gemini semantic extraction.
 
 import gc
 import json
+import math
 import os
 import struct
 import tempfile
@@ -141,6 +142,32 @@ def validate_audio_file(fp: str) -> Dict[str, Any]:
     }
 
 
+def _sanitize_json(obj: Any) -> Any:
+    """Recursively replace NaN/Inf floats with None so FastAPI's JSONResponse
+    (strict json.dumps with allow_nan=False) can serialize the result.
+
+    numpy.corrcoef / divisions over silent or near-silent blocks can emit NaN
+    which otherwise fails at the response boundary with:
+      ValueError: Out of range float values are not JSON compliant: nan
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, (np.floating,)):
+        f = float(obj)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return [_sanitize_json(x) for x in obj.tolist()]
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    return obj
+
+
 def _fuse_path_to_gs_uri(fp: str) -> Optional[str]:
     """If `fp` is under the GCSFuse mount, return the corresponding gs:// URI.
 
@@ -208,7 +235,7 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
     input_gs_uri = _fuse_path_to_gs_uri(fp)
     sections = _detect_sections(mono, sr, envs, input_gs_uri=input_gs_uri)
 
-    return {
+    return _sanitize_json({
         "track_identity": {
             "duration_sec": duration_sec,
             "sample_rate": sr,
@@ -220,7 +247,7 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
         "time_series_circuit_envelopes": envs,
         "physical_sections": sections,
         "detected_problems": _detect_problems(metrics),
-    }
+    })
 
 
 def _compute_envelopes(
