@@ -105,10 +105,14 @@ class ParamConstraint(typing.TypedDict):
 
 
 class MacroFormResponse(typing.TypedDict):
-    """Top-level Gemini response: sections + parameter constraints."""
+    """Top-level Gemini response: sections + parameter constraints + track identity."""
     sections: List[SectionSemanticContext]
     constraints: List[ParamConstraint]
     overall_assessment: str
+    estimated_bpm: float
+    estimated_key: str
+    genre: str
+    mood: str
 
 
 def _build_k_weight_sos(sr: int) -> NDArray:
@@ -236,8 +240,9 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
     del lk, rk, spec
     gc.collect()
 
-    bpm = _estimate_bpm(mono, sr)
-    key = _estimate_key(mono, sr)
+    # Fallback BPM/key from DSP (used only when Gemini is unavailable)
+    bpm_fallback = _estimate_bpm(mono, sr)
+    key_fallback = _estimate_key(mono, sr)
     bit_depth = _detect_bit_depth(fp)
 
     problems = _detect_problems(metrics)
@@ -250,13 +255,25 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
     sections = gemini_result["sections"]
     param_guardrails = gemini_result.get("param_guardrails")
 
+    # Prefer Gemini's BPM/Key/Genre/Mood — it actually *listens* to the audio.
+    # Fall back to the naive DSP estimators only when Vertex AI is unavailable.
+    gemini_identity = gemini_result.get("gemini_identity") or {}
+    bpm = gemini_identity.get("estimated_bpm") or bpm_fallback
+    key = gemini_identity.get("estimated_key") or key_fallback
+    genre = gemini_identity.get("genre")
+    mood = gemini_identity.get("mood")
+
     return _sanitize_json({
         "track_identity": {
             "duration_sec": duration_sec,
             "sample_rate": sr,
             "bpm": bpm,
             "key": key,
+            "genre": genre,
+            "mood": mood,
             "bit_depth": bit_depth,
+            "bpm_source": "vertex-ai" if gemini_identity.get("estimated_bpm") else "dsp-fallback",
+            "key_source": "vertex-ai" if gemini_identity.get("estimated_key") else "dsp-fallback",
         },
         "whole_track_metrics": metrics,
         "time_series_circuit_envelopes": envs,
@@ -516,15 +533,25 @@ def _extract_macro_form(
             problems_block = f"\n\nDetected Engineering Problems:\n{json.dumps(problems, indent=2)}"
 
         prompt = (
-            f"Listen to this track ({duration:.1f}s). Do two things:\n"
+            f"Listen to this track ({duration:.1f}s). Do four things:\n"
             "\n"
-            "1. SECTIONS: Divide it into main musical sections "
+            "1. TRACK IDENTITY: Detect the following from the audio:\n"
+            "   - estimated_bpm: the tempo in BPM (beats per minute). "
+            "Listen carefully to the kick/snare pattern and count precisely. "
+            "Common ranges: EDM 120-150, Hip-Hop 70-100, Rock 100-140, Pop 90-130.\n"
+            "   - estimated_key: the musical key (e.g. 'C major', 'Ab minor', 'F# major').\n"
+            "   - genre: the primary genre (e.g. 'EDM', 'Hip-Hop', 'Pop', 'Rock', 'R&B', "
+            "'Jazz', 'Classical', 'Lo-Fi', 'Future Bass', 'House', 'Trap', 'Drill', etc).\n"
+            "   - mood: the overall mood/energy (e.g. 'Energetic', 'Melancholic', "
+            "'Chill', 'Aggressive', 'Uplifting', 'Dark', 'Dreamy').\n"
+            "\n"
+            "2. SECTIONS: Divide it into main musical sections "
             "(Intro, Verse, Build-up, Drop, Breakdown, Outro, etc).\n"
             "RULES: First section starts at 0.0. "
             f"Last section ends at {duration:.1f}. "
             "No section shorter than 15 seconds. Be objective and precise.\n"
             "\n"
-            "2. CONSTRAINTS: Based on what you hear AND the measured metrics below, "
+            "3. CONSTRAINTS: Based on what you hear AND the measured metrics below, "
             "output parameter constraints for the downstream mastering AI.\n"
             "Available DSP parameters:\n"
             "- transformer_saturation (0-1.0), transformer_mix (0-1.0)\n"
@@ -536,7 +563,9 @@ def _extract_macro_form(
             "- comp_ratio (1.5-6), comp_threshold_db (-24 to -6)\n"
             "- dyn_eq_enabled (0 or 1)\n"
             "For each constraint: param_name, constraint_type (max/min/force), value, reason.\n"
-            "Only constrain what the signal requires. Do NOT over-constrain."
+            "Only constrain what the signal requires. Do NOT over-constrain.\n"
+            "\n"
+            "4. OVERALL ASSESSMENT: A brief engineer's note on the track's sonic character."
             f"{metrics_block}{problems_block}"
         )
         resp = client.models.generate_content(
@@ -587,6 +616,7 @@ def _detect_sections(
 
     ai_secs = gemini_result.get("sections", []) if gemini_result else []
     param_guardrails = None
+    gemini_identity = None
     if gemini_result:
         constraints = gemini_result.get("constraints", [])
         assessment = gemini_result.get("overall_assessment", "")
@@ -595,6 +625,13 @@ def _detect_sections(
                 "constraints": constraints,
                 "overall_assessment": assessment,
             }
+        # Extract track-level identity detected by Vertex AI
+        gemini_identity = {
+            "estimated_bpm": gemini_result.get("estimated_bpm"),
+            "estimated_key": gemini_result.get("estimated_key"),
+            "genre": gemini_result.get("genre"),
+            "mood": gemini_result.get("mood"),
+        }
 
     if ai_secs and len(ai_secs) > 0:
         sections = []
@@ -632,10 +669,10 @@ def _detect_sections(
                 "semantic_context": ctx,
             })
         if sections:
-            return {"sections": sections, "param_guardrails": param_guardrails}
+            return {"sections": sections, "param_guardrails": param_guardrails, "gemini_identity": gemini_identity}
 
     # 2. DSP fallback (no Gemini)
-    return {"sections": _dsp_fallback(lufs_e, width_e, duration), "param_guardrails": param_guardrails}
+    return {"sections": _dsp_fallback(lufs_e, width_e, duration), "param_guardrails": param_guardrails, "gemini_identity": gemini_identity}
 
 
 def _dsp_fallback(
