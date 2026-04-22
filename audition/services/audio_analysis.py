@@ -113,6 +113,8 @@ class MacroFormResponse(typing.TypedDict):
     estimated_key: str
     genre: str
     mood: str
+    recommended_target_lufs: float
+    recommended_target_true_peak: float
 
 
 def _build_k_weight_sos(sr: int) -> NDArray:
@@ -280,6 +282,8 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
         "physical_sections": sections,
         "detected_problems": problems,
         "param_guardrails": param_guardrails,
+        "recommended_target_lufs": gemini_identity.get("recommended_target_lufs") if gemini_identity else None,
+        "recommended_target_true_peak": gemini_identity.get("recommended_target_true_peak") if gemini_identity else None,
     })
 
 
@@ -533,7 +537,7 @@ def _extract_macro_form(
             problems_block = f"\n\nDetected Engineering Problems:\n{json.dumps(problems, indent=2)}"
 
         prompt = (
-            f"Listen to this track ({duration:.1f}s). Do four things:\n"
+            f"Listen to this track ({duration:.1f}s). Do five things:\n"
             "\n"
             "1. TRACK IDENTITY: Detect the following from the audio:\n"
             "   - estimated_bpm: the tempo in BPM (beats per minute). "
@@ -565,7 +569,22 @@ def _extract_macro_form(
             "For each constraint: param_name, constraint_type (max/min/force), value, reason.\n"
             "Only constrain what the signal requires. Do NOT over-constrain.\n"
             "\n"
-            "4. OVERALL ASSESSMENT: A brief engineer's note on the track's sonic character."
+            "4. OVERALL ASSESSMENT: A brief engineer's note on the track's sonic character.\n"
+            "\n"
+            "5. MASTERING TARGETS: Based on what you hear, the genre, energy level, "
+            "dynamics, and the measured metrics, determine the optimal mastering targets "
+            "for THIS specific track. You are a dance music mastering specialist. "
+            "Your goal is to find the absolute best loudness point for this track — "
+            "the point just before the limit where the track sounds its best.\n"
+            "   - recommended_target_lufs (float): The optimal integrated loudness "
+            "target in LUFS for this track. Consider the genre and energy. "
+            "Dance/EDM tracks typically target -6 to -9 LUFS. "
+            "Gentler tracks may target -10 to -14 LUFS. "
+            "Choose what is BEST for THIS track based on what you hear.\n"
+            "   - recommended_target_true_peak (float): The optimal true peak ceiling "
+            "in dBTP. Aggressive dance music can go to -0.1 dBTP. "
+            "Tracks with dense transients may need -0.3 to -0.5 dBTP. "
+            "Choose based on the transient character you hear."
             f"{metrics_block}{problems_block}"
         )
         resp = client.models.generate_content(
@@ -631,6 +650,8 @@ def _detect_sections(
             "estimated_key": gemini_result.get("estimated_key"),
             "genre": gemini_result.get("genre"),
             "mood": gemini_result.get("mood"),
+            "recommended_target_lufs": gemini_result.get("recommended_target_lufs"),
+            "recommended_target_true_peak": gemini_result.get("recommended_target_true_peak"),
         }
 
     if ai_secs and len(ai_secs) > 0:
