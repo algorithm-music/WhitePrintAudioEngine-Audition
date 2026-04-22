@@ -285,6 +285,8 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
         "param_guardrails": param_guardrails,
         "recommended_target_lufs": gemini_identity.get("recommended_target_lufs") if gemini_identity else None,
         "recommended_target_true_peak": gemini_identity.get("recommended_target_true_peak") if gemini_identity else None,
+        "track_title": gemini_identity.get("track_title") if gemini_identity else None,
+        "track_title_romaji": gemini_identity.get("track_title_romaji") if gemini_identity else None,
     })
 
 
@@ -540,7 +542,7 @@ def _extract_macro_form(
 
         track_name_block = f" (Title: {track_name})" if track_name else ""
         prompt = (
-            f"Listen to this track{track_name_block} ({duration:.1f}s). Do five things:\n"
+            f"Listen to this track{track_name_block} ({duration:.1f}s). Do six things:\n"
             "\n"
             "1. TRACK IDENTITY: Detect the following from the audio:\n"
             "   - estimated_bpm: the tempo in BPM (beats per minute). "
@@ -576,18 +578,30 @@ def _extract_macro_form(
             "\n"
             "5. MASTERING TARGETS: Based on what you hear, the genre, energy level, "
             "dynamics, and the measured metrics, determine the optimal mastering targets "
-            "for THIS specific track. You are a dance music mastering specialist. "
+            "for THIS specific track. You are a professional mastering engineer. "
             "Your goal is to find the absolute best loudness point for this track — "
             "the point just before the limit where the track sounds its best.\n"
             "   - recommended_target_lufs (float): The optimal integrated loudness "
-            "target in LUFS for this track. Consider the genre and energy. "
-            "Dance/EDM tracks typically target -6 to -9 LUFS. "
-            "Gentler tracks may target -10 to -14 LUFS. "
-            "Choose what is BEST for THIS track based on what you hear.\n"
+            "target in LUFS for this track. You decide based entirely on what you hear "
+            "and the measured metrics. Consider the genre, energy, dynamics, and "
+            "intended listening context.\n"
             "   - recommended_target_true_peak (float): The optimal true peak ceiling "
-            "in dBTP. Aggressive dance music can go to -0.1 dBTP. "
-            "Tracks with dense transients may need -0.3 to -0.5 dBTP. "
-            "Choose based on the transient character you hear."
+            "in dBTP. You decide based on the transient character, density, and "
+            "genre requirements you hear. Consider what ceiling will preserve "
+            "transient quality while maximizing loudness.\n"
+            "\n"
+            "6. TRACK TITLE: Determine the proper title for this track. "
+            "If the filename already contains a meaningful title, preserve and refine it. "
+            "If the filename is meaningless (timestamps, hashes, 'Untitled', etc), "
+            "create an evocative title that reflects the track's sonic character.\n"
+            "   - track_title (string): The track title in its original language. "
+            "If the track has Japanese elements or the filename contains Japanese, "
+            "use Japanese (e.g. '秋の田'). For other tracks, use English "
+            "(e.g. 'Midnight Drive'). Keep it concise and evocative.\n"
+            "   - track_title_romaji (string): The romanized version of the title. "
+            "For Japanese titles, provide romaji (e.g. 'Aki_no_ta'). "
+            "For English titles, use underscore-separated words (e.g. 'Midnight_Drive'). "
+            "Use underscores instead of spaces. This will be used for the filename."
             f"{metrics_block}{problems_block}"
         )
         resp = client.models.generate_content(
@@ -657,6 +671,8 @@ def _detect_sections(
             "mood": gemini_result.get("mood"),
             "recommended_target_lufs": gemini_result.get("recommended_target_lufs"),
             "recommended_target_true_peak": gemini_result.get("recommended_target_true_peak"),
+            "track_title": gemini_result.get("track_title"),
+            "track_title_romaji": gemini_result.get("track_title_romaji"),
         }
 
     if ai_secs and len(ai_secs) > 0:
