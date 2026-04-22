@@ -253,7 +253,8 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
     # place; otherwise _extract_macro_form falls back to writing a 16 kHz
     # downsample.
     input_gs_uri = _fuse_path_to_gs_uri(fp)
-    gemini_result = _detect_sections(mono, sr, envs, metrics, problems, input_gs_uri=input_gs_uri)
+    track_name = os.path.splitext(os.path.basename(fp))[0]
+    gemini_result = _detect_sections(mono, sr, envs, metrics, problems, input_gs_uri=input_gs_uri, track_name=track_name)
     sections = gemini_result["sections"]
     param_guardrails = gemini_result.get("param_guardrails")
 
@@ -490,6 +491,7 @@ def _extract_macro_form(
     metrics: Dict[str, Any] = None,
     problems: List[Dict[str, Any]] = None,
     input_gs_uri: Optional[str] = None,
+    track_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Listen to full track with Gemini on Vertex AI.
 
@@ -536,8 +538,9 @@ def _extract_macro_form(
         if problems:
             problems_block = f"\n\nDetected Engineering Problems:\n{json.dumps(problems, indent=2)}"
 
+        track_name_block = f" (Title: {track_name})" if track_name else ""
         prompt = (
-            f"Listen to this track ({duration:.1f}s). Do five things:\n"
+            f"Listen to this track{track_name_block} ({duration:.1f}s). Do five things:\n"
             "\n"
             "1. TRACK IDENTITY: Detect the following from the audio:\n"
             "   - estimated_bpm: the tempo in BPM (beats per minute). "
@@ -619,6 +622,7 @@ def _detect_sections(
     metrics: Dict[str, Any] = None,
     problems: List[Dict[str, Any]] = None,
     input_gs_uri: Optional[str] = None,
+    track_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """AI-driven segmentation with DSP fallback. Returns dict with sections and param_guardrails."""
     lufs_e = np.array(envs.get("lufs", []))
@@ -631,6 +635,7 @@ def _detect_sections(
         mono, sr, duration,
         metrics=metrics, problems=problems,
         input_gs_uri=input_gs_uri,
+        track_name=track_name,
     )
 
     ai_secs = gemini_result.get("sections", []) if gemini_result else []
