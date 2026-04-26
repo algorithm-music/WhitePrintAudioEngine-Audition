@@ -104,7 +104,11 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
     os.close(fd)
     
     try:
-        await asyncio.to_thread(shutil.copy2, path, local_tmp)
+        try:
+            await asyncio.to_thread(shutil.copy2, path, local_tmp)
+        except OSError as e:
+            logger.error(f"FUSE copy failed: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to stage file for analysis: {e}")
         
         try:
             await asyncio.to_thread(validate_audio_file, local_tmp)

@@ -4,7 +4,11 @@
     "sample_rate": 48000,
     "bpm": 69.4,
     "key": "F# minor",
-    "bit_depth": 24
+    "genre": "Trap / Dark Ambient",
+    "mood": "Dark",
+    "bit_depth": 24,
+    "bpm_source": "vertex-ai",
+    "key_source": "vertex-ai"
   },
   "whole_track_metrics": {
     "integrated_lufs": -11.6,
@@ -38,7 +42,7 @@
   },
   "physical_sections": [
     {
-      "section_id": "SEC_0",
+      "section_id": "SEC_0_Intro",
       "start_sec": 0.0,
       "end_sec": 43.5,
       "avg_lufs": -15.9,
@@ -54,7 +58,7 @@
       }
     },
     {
-      "section_id": "SEC_1",
+      "section_id": "SEC_1_Verse",
       "start_sec": 43.5,
       "end_sec": 125.2,
       "avg_lufs": -15.3,
@@ -71,7 +75,7 @@
       }
     },
     {
-      "section_id": "SEC_2",
+      "section_id": "SEC_2_Drop",
       "start_sec": 125.2,
       "end_sec": 133.9,
       "avg_lufs": -14.0,
@@ -88,7 +92,7 @@
       }
     },
     {
-      "section_id": "SEC_3",
+      "section_id": "SEC_3_Outro",
       "start_sec": 133.9,
       "end_sec": 283.32,
       "avg_lufs": -16.9,
@@ -104,5 +108,10 @@
       }
     }
   ],
-  "detected_problems": []
+  "detected_problems": [],
+  "param_guardrails": null,
+  "recommended_target_lufs": null,
+  "recommended_target_true_peak": null,
+  "track_title": null,
+  "track_title_romaji": null
 }
