@@ -6,6 +6,7 @@ Performs BS.1770-4 compliant audio analysis with Gemini semantic extraction.
 """
 
 import gc
+import io
 import json
 import logging
 import math
@@ -531,7 +532,6 @@ def _true_peak_chunked(left: NDArray, right: NDArray) -> float:
 def _extract_macro_form(
     mono: NDArray, sr: int, duration: float,
     metrics: Dict[str, Any] = None,
-    input_gs_uri: Optional[str] = None,
     track_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Listen to full track with Gemini on Vertex AI.
@@ -547,8 +547,6 @@ def _extract_macro_form(
     """
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
-    gcs_mount = os.environ.get("GCSFUSE_MOUNT", "/mnt/gcs/aimastering-tmp-audio")
-    gcs_bucket = os.environ.get("GCSFUSE_BUCKET", "aidriven-mastering-fyqu-source-bucket")
     if not project:
         logger.warning("GOOGLE_CLOUD_PROJECT not set; skipping Gemini extraction.")
         return None
@@ -556,25 +554,17 @@ def _extract_macro_form(
     client = genai.Client(vertexai=True, project=project, location=location)
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-    # Fast path: input already on GCS — Vertex reads it in place.
-    if input_gs_uri is not None:
-        gs_uri = input_gs_uri
-        fuse_path = None
-    else:
-        if not os.path.isdir(gcs_mount):
-            logger.warning("GCSFuse mount missing at %s; skipping Gemini extraction.", gcs_mount)
-            return None
-        # Downsample to 16 kHz mono and write it through the FUSE mount.
-        target_sr = GEMINI_DOWNSAMPLE_SR
-        down = resample_poly(mono, target_sr, sr)
-        object_name = f"vertex-audio-{uuid.uuid4().hex}.wav"
-        fuse_path = os.path.join(gcs_mount, object_name)
-        gs_uri = f"gs://{gcs_bucket}/{object_name}"
+    # Downsample to 16 kHz mono WAV in memory for Gemini.
+    target_sr = GEMINI_DOWNSAMPLE_SR
+    down = resample_poly(mono, target_sr, sr)
+    audio_buf = io.BytesIO()
+    sf.write(audio_buf, down, target_sr, format="WAV", subtype="PCM_16")
+    audio_bytes = audio_buf.getvalue()
+    audio_buf.close()
+    del down
+    logger.info("Prepared %d bytes of 16kHz WAV for Gemini.", len(audio_bytes))
 
     try:
-        if fuse_path is not None:
-            # Writing through the GCSFuse mount streams to GCS without buffering.
-            sf.write(fuse_path, down, target_sr)
 
         metrics_block = ""
         if metrics:
@@ -665,8 +655,8 @@ def _extract_macro_form(
             model=model_name,
             contents=[
                 prompt,
-                genai_types.Part.from_uri(
-                    file_uri=gs_uri, mime_type="audio/wav"
+                genai_types.Part.from_bytes(
+                    data=audio_bytes, mime_type="audio/wav"
                 ),
             ],
             config=genai_types.GenerateContentConfig(
@@ -681,11 +671,7 @@ def _extract_macro_form(
         logger.warning("Gemini macro-form failed: %s", e)
         return None
     finally:
-        try:
-            if fuse_path is not None and os.path.exists(fuse_path):
-                os.remove(fuse_path)
-        except Exception:
-            pass
+        del audio_bytes
 
 
 def _detect_sections(
