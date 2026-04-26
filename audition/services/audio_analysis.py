@@ -249,12 +249,8 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
 
     problems = _detect_problems(metrics)
 
-    # If the input file lives on the GCSFuse mount, Vertex can read it in
-    # place; otherwise _extract_macro_form falls back to writing a 16 kHz
-    # downsample.
-    input_gs_uri = _fuse_path_to_gs_uri(fp)
     track_name = os.path.splitext(os.path.basename(fp))[0]
-    gemini_result = _detect_sections(mono, sr, envs, metrics, problems, input_gs_uri=input_gs_uri, track_name=track_name)
+    gemini_result = _detect_sections(mono, sr, envs, metrics, problems, track_name=track_name)
     sections = gemini_result["sections"]
     param_guardrails = gemini_result.get("param_guardrails")
 
@@ -496,7 +492,6 @@ def _detect_sections(
     mono: NDArray, sr: int, envs: Dict[str, Any],
     metrics: Dict[str, Any] = None,
     problems: List[Dict[str, Any]] = None,
-    input_gs_uri: Optional[str] = None,
     track_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """AI-driven segmentation with DSP fallback. Returns dict with sections and param_guardrails."""
@@ -508,8 +503,7 @@ def _detect_sections(
     # 1. Try Gemini (1 API call for sections + constraints)
     gemini_result = _extract_macro_form(
         mono, sr, duration,
-        metrics=metrics, problems=problems,
-        input_gs_uri=input_gs_uri,
+        metrics=metrics,
         track_name=track_name,
     )
 
