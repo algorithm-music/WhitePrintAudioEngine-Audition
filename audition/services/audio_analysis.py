@@ -27,6 +27,8 @@ from scipy.signal import butter, resample_poly, sosfilt
 LOG_FLOOR = 1e-10
 A4_HZ = 440.0
 TIME_SERIES_RESOLUTION_SEC = 0.1
+TRUE_PEAK_CHUNK_GATE = 0.5
+GEMINI_DOWNSAMPLE_SR = 16000
 
 BAND_EDGES = {
     "sub": (20.0, 60.0),
