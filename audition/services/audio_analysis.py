@@ -6,7 +6,9 @@ Performs BS.1770-4 compliant audio analysis with Gemini semantic extraction.
 """
 
 import gc
+import io
 import json
+import logging
 import math
 import os
 import struct
@@ -23,6 +25,8 @@ from google.genai import types as genai_types
 from numpy.lib.stride_tricks import sliding_window_view
 from numpy.typing import NDArray
 from scipy.signal import butter, resample_poly, sosfilt
+
+logger = logging.getLogger("audition.analysis")
 
 LOG_FLOOR = 1e-10
 A4_HZ = 440.0
