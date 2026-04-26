@@ -185,27 +185,123 @@ def _sanitize_json(obj: Any) -> Any:
     return obj
 
 
-def _fuse_path_to_gs_uri(fp: str) -> Optional[str]:
-    """If `fp` is under the GCSFuse mount, return the corresponding gs:// URI.
+def _extract_macro_form(
+    mono: NDArray, sr: int, duration: float,
+    metrics: Dict[str, Any] = None,
+    track_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Listen to full track with Gemini on Vertex AI.
 
-    This lets us hand the original audio to Vertex by reference, with no
-    re-upload and no intermediate downsample. Returns None if the path is
-    outside the mount (e.g. /tmp fallback), so the caller falls back to the
-    write-downsampled-copy path.
+    Downsamples to 16 kHz mono WAV in memory and sends bytes directly
+    via Part.from_bytes — no GCSFuse volume mount required.
+
+    Returns sections, parameter constraints, detected problems, and
+    overall assessment in a single API call.
     """
-    gcs_mount = os.environ.get("GCSFUSE_MOUNT", "/mnt/gcs/aimastering-tmp-audio")
-    gcs_bucket = os.environ.get("GCSFUSE_BUCKET", "aidriven-mastering-fyqu-source-bucket")
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
+    if not project:
+        logger.warning("GOOGLE_CLOUD_PROJECT not set; skipping Gemini extraction.")
+        return None
+
+    client = genai.Client(vertexai=True, project=project, location=location)
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+    # Downsample to 16 kHz mono WAV in memory for Gemini.
+    target_sr = GEMINI_DOWNSAMPLE_SR
+    down = resample_poly(mono, target_sr, sr)
+    audio_buf = io.BytesIO()
+    sf.write(audio_buf, down, target_sr, format="WAV", subtype="PCM_16")
+    audio_bytes = audio_buf.getvalue()
+    audio_buf.close()
+    del down
+    logger.info("Prepared %d bytes of 16kHz WAV for Gemini.", len(audio_bytes))
+
     try:
-        abs_fp = os.path.abspath(fp)
-        abs_mount = os.path.abspath(gcs_mount).rstrip("/") + "/"
-        if abs_fp.startswith(abs_mount):
-            rel = abs_fp[len(abs_mount):]
-            # GCS object names use forward slashes regardless of OS.
-            rel = rel.replace(os.sep, "/")
-            return f"gs://{gcs_bucket}/{rel}"
-    except Exception:
-        pass
-    return None
+        metrics_block = ""
+        if metrics:
+            metrics_block = f"\n\nMeasured Signal Metrics:\n{json.dumps(metrics, indent=2)}"
+
+        track_name_block = f" (Title: {track_name})" if track_name else ""
+        prompt = (
+            f"Listen to this track{track_name_block} ({duration:.1f}s). Do seven things:\n"
+            "\n"
+            "1. TRACK IDENTITY: Detect the following from the audio:\n"
+            "   - estimated_bpm: the tempo in BPM (beats per minute). "
+            "Listen carefully to the kick/snare pattern and count precisely. "
+            "Common ranges: EDM 120-150, Hip-Hop 70-100, Rock 100-140, Pop 90-130.\n"
+            "   - estimated_key: the musical key (e.g. 'C major', 'Ab minor', 'F# major').\n"
+            "   - genre: the primary genre (e.g. 'EDM', 'Hip-Hop', 'Pop', 'Rock', 'R&B', "
+            "'Jazz', 'Classical', 'Lo-Fi', 'Future Bass', 'House', 'Trap', 'Drill', etc).\n"
+            "   - mood: the overall mood/energy (e.g. 'Energetic', 'Melancholic', "
+            "'Chill', 'Aggressive', 'Uplifting', 'Dark', 'Dreamy').\n"
+            "\n"
+            "2. SECTIONS: Divide it into main musical sections "
+            "(Intro, Verse, Build-up, Drop, Breakdown, Outro, etc).\n"
+            "RULES: First section starts at 0.0. "
+            f"Last section ends at {duration:.1f}. "
+            "No section shorter than 15 seconds. Be objective and precise.\n"
+            "\n"
+            "3. CONSTRAINTS: Based on what you hear AND the measured metrics below, "
+            "output parameter constraints for the downstream mastering AI.\n"
+            "Available DSP parameters:\n"
+            "- transformer_saturation (0-1.0), transformer_mix (0-1.0)\n"
+            "- triode_drive (0-1.0), triode_mix (0-1.0)\n"
+            "- tape_saturation (0-1.0), tape_mix (0-1.0)\n"
+            "- eq_low_mid_gain_db (-6 to 6), eq_high_mid_gain_db (-6 to 6)\n"
+            "- parallel_wet (0-0.5)\n"
+            "- stereo_low_mono (0-1.0), stereo_width (0.8-1.3)\n"
+            "- comp_ratio (1.5-6), comp_threshold_db (-24 to -6)\n"
+            "- dyn_eq_enabled (0 or 1)\n"
+            "For each constraint: param_name, constraint_type (max/min/force), value, reason.\n"
+            "Only constrain what the signal requires. Do NOT over-constrain.\n"
+            "\n"
+            "4. OVERALL ASSESSMENT: A brief engineer's note on the track's sonic character.\n"
+            "\n"
+            "5. MASTERING TARGETS: Based on what you hear, the genre, energy level, "
+            "dynamics, and the measured metrics, determine the optimal mastering targets "
+            "for THIS specific track. You are a professional mastering engineer. "
+            "Your goal is to find the absolute best loudness point for this track — "
+            "the point just before the limit where the track sounds its best.\n"
+            "   - recommended_target_lufs (float): The optimal integrated loudness "
+            "target in LUFS for this track.\n"
+            "   - recommended_target_true_peak (float): The optimal true peak ceiling "
+            "in dBTP.\n"
+            "\n"
+            "6. TRACK TITLE: Determine the proper title for this track. "
+            "If the filename already contains a meaningful title, preserve and refine it. "
+            "If the filename is meaningless, create an evocative title.\n"
+            "   - track_title (string): The track title in its original language.\n"
+            "   - track_title_romaji (string): The romanized version.\n"
+            "\n"
+            "7. PROBLEM DETECTION: Based on what you hear AND the measured metrics, "
+            "identify any engineering problems in the audio.\n"
+            "For each problem: issue (short identifier), severity (high/medium/low), "
+            "value (the measured metric value), detail (brief explanation).\n"
+            "If the track has no problems, return an empty list."
+            f"{metrics_block}"
+        )
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=[
+                prompt,
+                genai_types.Part.from_bytes(
+                    data=audio_bytes, mime_type="audio/wav"
+                ),
+            ],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=MacroFormResponse,
+                temperature=0.0,
+            ),
+        )
+        result = json.loads(resp.text)
+        return result
+    except Exception as e:
+        logger.warning("Gemini macro-form failed: %s", e)
+        return None
+    finally:
+        del audio_bytes
 
 
 def analyze_audio_file(fp: str) -> Dict[str, Any]:
