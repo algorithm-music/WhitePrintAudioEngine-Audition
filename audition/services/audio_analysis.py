@@ -6,9 +6,7 @@ Performs BS.1770-4 compliant audio analysis with Gemini semantic extraction.
 """
 
 import gc
-import io
 import json
-import logging
 import math
 import os
 import struct
@@ -26,37 +24,9 @@ from numpy.lib.stride_tricks import sliding_window_view
 from numpy.typing import NDArray
 from scipy.signal import butter, resample_poly, sosfilt
 
-logger = logging.getLogger("audition.analysis")
-
 LOG_FLOOR = 1e-10
 A4_HZ = 440.0
 TIME_SERIES_RESOLUTION_SEC = 0.1
-
-# --- Signal Processing Constants ---
-LOW_MONO_CUTOFF_HZ = 120.0
-HARSHNESS_BAND_LO_HZ = 2000.0
-HARSHNESS_BAND_HI_HZ = 6000.0
-HARSHNESS_SCALE_FACTOR = 3.0
-MUD_NORM_CENTER = 0.15
-MUD_NORM_RANGE = 0.15
-TRUE_PEAK_OVERSAMPLE = 4
-TRUE_PEAK_CHUNK_SAMPLES = 44100 * 5
-TRUE_PEAK_SKIP_THRESHOLD = 1e-4
-TRUE_PEAK_CHUNK_GATE = 0.5
-GEMINI_DOWNSAMPLE_SR = 16000
-
-# --- Problem Detection ---
-# No hardcoded thresholds. Vertex AI Gemini listens to the audio
-# and determines all problem detection autonomously.
-
-# --- DSP Fallback Section Detection ---
-MIN_SECTION_SEC = 15.0
-MIN_ENVELOPE_FRAMES = 100
-NOVELTY_SMOOTHING_SEC = 3.0
-NOVELTY_THRESHOLD_SIGMA = 1.2
-NOVELTY_WIDTH_WEIGHT = 0.3
-FALLBACK_LUFS = -14.0
-FALLBACK_BIT_DEPTH = 24
 
 BAND_EDGES = {
     "sub": (20.0, 60.0),
@@ -134,19 +104,10 @@ class ParamConstraint(typing.TypedDict):
     reason: str
 
 
-class DetectedProblem(typing.TypedDict):
-    """An engineering problem detected by Vertex AI after listening to the audio."""
-    issue: str
-    severity: str          # "high", "medium", or "low"
-    value: float
-    detail: str
-
-
 class MacroFormResponse(typing.TypedDict):
-    """Top-level Gemini response — the AI that actually listens decides everything."""
+    """Top-level Gemini response: sections + parameter constraints + track identity."""
     sections: List[SectionSemanticContext]
     constraints: List[ParamConstraint]
-    detected_problems: List[DetectedProblem]
     overall_assessment: str
     estimated_bpm: float
     estimated_key: str
@@ -286,26 +247,24 @@ def analyze_audio_file(fp: str) -> Dict[str, Any]:
     key_fallback = _estimate_key(mono, sr)
     bit_depth = _detect_bit_depth(fp)
 
+    problems = _detect_problems(metrics)
+
     # If the input file lives on the GCSFuse mount, Vertex can read it in
     # place; otherwise _extract_macro_form falls back to writing a 16 kHz
     # downsample.
     input_gs_uri = _fuse_path_to_gs_uri(fp)
     track_name = os.path.splitext(os.path.basename(fp))[0]
-    gemini_result = _detect_sections(mono, sr, envs, metrics, input_gs_uri=input_gs_uri, track_name=track_name)
+    gemini_result = _detect_sections(mono, sr, envs, metrics, problems, input_gs_uri=input_gs_uri, track_name=track_name)
     sections = gemini_result["sections"]
     param_guardrails = gemini_result.get("param_guardrails")
 
-    # Vertex AI decides everything — it actually *listens* to the audio.
-    # DSP estimators are fallback only when Vertex AI is unavailable.
+    # Prefer Gemini's BPM/Key/Genre/Mood — it actually *listens* to the audio.
+    # Fall back to the naive DSP estimators only when Vertex AI is unavailable.
     gemini_identity = gemini_result.get("gemini_identity") or {}
     bpm = gemini_identity.get("estimated_bpm") or bpm_fallback
     key = gemini_identity.get("estimated_key") or key_fallback
     genre = gemini_identity.get("genre")
     mood = gemini_identity.get("mood")
-
-    # Problem detection: Vertex AI's judgment, not hardcoded thresholds.
-    # Only the AI that listens to the audio has authority to judge.
-    problems = gemini_result.get("detected_problems", [])
 
     return _sanitize_json({
         "track_identity": {
@@ -377,7 +336,7 @@ def _compute_envelopes(
     wf = np.sum(pwr * freqs, axis=1)
     bright = wf / te / (cs // 2)
 
-    lp = butter(4, LOW_MONO_CUTOFF_HZ, btype="lowpass", fs=sr, output="sos")
+    lp = butter(4, 120.0, btype="lowpass", fs=sr, output="sos")
     ll = sosfilt(lp, l_ch, axis=1).astype(np.float32, copy=False)
     rl = sosfilt(lp, r_ch, axis=1).astype(np.float32, copy=False)
     llm = np.mean(ll, axis=1, keepdims=True)
@@ -471,12 +430,12 @@ def _compute_metrics(
             float(np.sum(spec.mono_power[mask]) / te), 4
         )
 
-    hm = (spec.freqs >= HARSHNESS_BAND_LO_HZ) & (spec.freqs < HARSHNESS_BAND_HI_HZ)
+    hm = (spec.freqs >= 2000) & (spec.freqs < 6000)
     hr = np.clip(
-        (np.sum(spec.mono_power[hm]) / te) * HARSHNESS_SCALE_FACTOR, 0.0, 1.0
+        (np.sum(spec.mono_power[hm]) / te) * 3.0, 0.0, 1.0
     )
     mr = np.clip(
-        (ratios.get("low_mid_ratio", 0.0) - MUD_NORM_CENTER) / MUD_NORM_RANGE,
+        (ratios.get("low_mid_ratio", 0.0) - 0.15) / 0.15,
         0.0, 1.0,
     )
 
@@ -511,9 +470,9 @@ def _compute_metrics(
 
 def _true_peak_chunked(left: NDArray, right: NDArray) -> float:
     """Chunked 4x oversampled true peak."""
-    cs = TRUE_PEAK_CHUNK_SAMPLES
+    cs = 44100 * 5
     gm = max(np.max(np.abs(left)), np.max(np.abs(right)))
-    if gm < TRUE_PEAK_SKIP_THRESHOLD:
+    if gm < 1e-4:
         return float(gm)
 
     tpm = 0.0
@@ -522,178 +481,34 @@ def _true_peak_chunked(left: NDArray, right: NDArray) -> float:
         lc = left[si:ei]
         rc = right[si:ei]
         cm = max(np.max(np.abs(lc)), np.max(np.abs(rc)))
-        if cm > gm * TRUE_PEAK_CHUNK_GATE:
-            lo = resample_poly(lc, TRUE_PEAK_OVERSAMPLE, 1)
-            ro = resample_poly(rc, TRUE_PEAK_OVERSAMPLE, 1)
+        if cm > gm * 0.5:
+            lo = resample_poly(lc, 4, 1)
+            ro = resample_poly(rc, 4, 1)
             tpm = max(tpm, np.max(np.abs(lo)), np.max(np.abs(ro)))
     return float(max(tpm, gm))
 
 
-def _extract_macro_form(
-    mono: NDArray, sr: int, duration: float,
-    metrics: Dict[str, Any] = None,
-    track_name: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """Listen to full track with Gemini on Vertex AI.
 
-    Returns sections, parameter constraints, detected problems, and
-    overall assessment in a single API call.  The AI hears the actual
-    audio AND sees the measured metrics, so every judgment is grounded
-    in both perception and measurement.
 
-    No hardcoded thresholds exist in this codebase.  ALL problem
-    detection, ALL constraint generation, and ALL target selection
-    are determined by Vertex AI after listening to the audio.
-    """
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
-    if not project:
-        logger.warning("GOOGLE_CLOUD_PROJECT not set; skipping Gemini extraction.")
-        return None
-
-    client = genai.Client(vertexai=True, project=project, location=location)
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-    # Downsample to 16 kHz mono WAV in memory for Gemini.
-    target_sr = GEMINI_DOWNSAMPLE_SR
-    down = resample_poly(mono, target_sr, sr)
-    audio_buf = io.BytesIO()
-    sf.write(audio_buf, down, target_sr, format="WAV", subtype="PCM_16")
-    audio_bytes = audio_buf.getvalue()
-    audio_buf.close()
-    del down
-    logger.info("Prepared %d bytes of 16kHz WAV for Gemini.", len(audio_bytes))
-
-    try:
-
-        metrics_block = ""
-        if metrics:
-            metrics_block = f"\n\nMeasured Signal Metrics:\n{json.dumps(metrics, indent=2)}"
-
-        track_name_block = f" (Title: {track_name})" if track_name else ""
-        prompt = (
-            f"Listen to this track{track_name_block} ({duration:.1f}s). Do seven things:\n"
-            "\n"
-            "1. TRACK IDENTITY: Detect the following from the audio:\n"
-            "   - estimated_bpm: the tempo in BPM (beats per minute). "
-            "Listen carefully to the kick/snare pattern and count precisely. "
-            "Common ranges: EDM 120-150, Hip-Hop 70-100, Rock 100-140, Pop 90-130.\n"
-            "   - estimated_key: the musical key (e.g. 'C major', 'Ab minor', 'F# major').\n"
-            "   - genre: the primary genre (e.g. 'EDM', 'Hip-Hop', 'Pop', 'Rock', 'R&B', "
-            "'Jazz', 'Classical', 'Lo-Fi', 'Future Bass', 'House', 'Trap', 'Drill', etc).\n"
-            "   - mood: the overall mood/energy (e.g. 'Energetic', 'Melancholic', "
-            "'Chill', 'Aggressive', 'Uplifting', 'Dark', 'Dreamy').\n"
-            "\n"
-            "2. SECTIONS: Divide it into main musical sections "
-            "(Intro, Verse, Build-up, Drop, Breakdown, Outro, etc).\n"
-            "RULES: First section starts at 0.0. "
-            f"Last section ends at {duration:.1f}. "
-            "No section shorter than 15 seconds. Be objective and precise.\n"
-            "\n"
-            "3. CONSTRAINTS: Based on what you hear AND the measured metrics below, "
-            "output parameter constraints for the downstream mastering AI.\n"
-            "Available DSP parameters:\n"
-            "- transformer_saturation (0-1.0), transformer_mix (0-1.0)\n"
-            "- triode_drive (0-1.0), triode_mix (0-1.0)\n"
-            "- tape_saturation (0-1.0), tape_mix (0-1.0)\n"
-            "- eq_low_mid_gain_db (-6 to 6), eq_high_mid_gain_db (-6 to 6)\n"
-            "- parallel_wet (0-0.5)\n"
-            "- stereo_low_mono (0-1.0), stereo_width (0.8-1.3)\n"
-            "- comp_ratio (1.5-6), comp_threshold_db (-24 to -6)\n"
-            "- dyn_eq_enabled (0 or 1)\n"
-            "For each constraint: param_name, constraint_type (max/min/force), value, reason.\n"
-            "Only constrain what the signal requires. Do NOT over-constrain.\n"
-            "\n"
-            "4. OVERALL ASSESSMENT: A brief engineer's note on the track's sonic character.\n"
-            "\n"
-            "5. MASTERING TARGETS: Based on what you hear, the genre, energy level, "
-            "dynamics, and the measured metrics, determine the optimal mastering targets "
-            "for THIS specific track. You are a professional mastering engineer. "
-            "Your goal is to find the absolute best loudness point for this track — "
-            "the point just before the limit where the track sounds its best.\n"
-            "   - recommended_target_lufs (float): The optimal integrated loudness "
-            "target in LUFS for this track. You decide based entirely on what you hear "
-            "and the measured metrics. Consider the genre, energy, dynamics, and "
-            "intended listening context.\n"
-            "   - recommended_target_true_peak (float): The optimal true peak ceiling "
-            "in dBTP. You decide based on the transient character, density, and "
-            "genre requirements you hear. Consider what ceiling will preserve "
-            "transient quality while maximizing loudness.\n"
-            "\n"
-            "6. TRACK TITLE: Determine the proper title for this track. "
-            "If the filename already contains a meaningful title, preserve and refine it. "
-            "If the filename is meaningless (timestamps, hashes, 'Untitled', etc), "
-            "create an evocative title that reflects the track's sonic character.\n"
-            "   - track_title (string): The track title in its original language. "
-            "If the track has Japanese elements or the filename contains Japanese, "
-            "use Japanese (e.g. '秋の田'). For other tracks, use English "
-            "(e.g. 'Midnight Drive'). Keep it concise and evocative.\n"
-            "   - track_title_romaji (string): The romanized version of the title. "
-            "For Japanese titles, provide romaji (e.g. 'Aki_no_ta'). "
-            "For English titles, use underscore-separated words (e.g. 'Midnight_Drive'). "
-            "Use underscores instead of spaces. This will be used for the filename.\n"
-            "\n"
-            "7. PROBLEM DETECTION: Based on what you hear AND the measured metrics, "
-            "identify any engineering problems in the audio. You are the only judge. "
-            "There are NO hardcoded thresholds — you decide what constitutes a problem "
-            "based on your perception of the audio AND the measured signal characteristics.\n"
-            "Consider issues such as:\n"
-            "- True peak approaching or exceeding safe levels for the genre\n"
-            "- Excessive mud or low-mid buildup that clouds the mix\n"
-            "- Phase cancellation in the low end that weakens the bass\n"
-            "- Harshness in the upper mids/highs that causes listener fatigue\n"
-            "- Over-compression (extremely low crest factor) that kills dynamics\n"
-            "- Stereo issues (excessive width, mono incompatibility)\n"
-            "- Any other sonic problems you perceive\n"
-            "For each problem: issue (short identifier), severity (high/medium/low), "
-            "value (the measured metric value), detail (brief explanation of why "
-            "this is a problem FOR THIS SPECIFIC TRACK given its genre and character).\n"
-            "If the track has no problems, return an empty list."
-            f"{metrics_block}"
-        )
-        resp = client.models.generate_content(
-            model=model_name,
-            contents=[
-                prompt,
-                genai_types.Part.from_bytes(
-                    data=audio_bytes, mime_type="audio/wav"
-                ),
-            ],
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=MacroFormResponse,
-                temperature=0.0,
-            ),
-        )
-        result = json.loads(resp.text)
-        return result
-    except Exception as e:
-        logger.warning("Gemini macro-form failed: %s", e)
-        return None
-    finally:
-        del audio_bytes
 
 
 def _detect_sections(
     mono: NDArray, sr: int, envs: Dict[str, Any],
     metrics: Dict[str, Any] = None,
+    problems: List[Dict[str, Any]] = None,
     input_gs_uri: Optional[str] = None,
     track_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """AI-driven segmentation with DSP fallback.
-
-    Returns dict with sections, param_guardrails, gemini_identity,
-    and detected_problems (all determined by Vertex AI).
-    """
+    """AI-driven segmentation with DSP fallback. Returns dict with sections and param_guardrails."""
     lufs_e = np.array(envs.get("lufs", []))
     width_e = np.array(envs.get("width", []))
     duration = float(len(mono) / sr)
     res = TIME_SERIES_RESOLUTION_SEC
 
-    # 1. Try Gemini (1 API call — Vertex AI decides everything)
+    # 1. Try Gemini (1 API call for sections + constraints)
     gemini_result = _extract_macro_form(
         mono, sr, duration,
-        metrics=metrics,
+        metrics=metrics, problems=problems,
         input_gs_uri=input_gs_uri,
         track_name=track_name,
     )
@@ -701,11 +516,9 @@ def _detect_sections(
     ai_secs = gemini_result.get("sections", []) if gemini_result else []
     param_guardrails = None
     gemini_identity = None
-    detected_problems = []
     if gemini_result:
         constraints = gemini_result.get("constraints", [])
         assessment = gemini_result.get("overall_assessment", "")
-        detected_problems = gemini_result.get("detected_problems", [])
         if constraints:
             param_guardrails = {
                 "constraints": constraints,
@@ -735,7 +548,7 @@ def _detect_sections(
             ei = min(int(es / res), len(lufs_e))
             al = (
                 round(float(np.mean(lufs_e[si:ei])), 1)
-                if si < ei and ei <= len(lufs_e) else FALLBACK_LUFS
+                if si < ei and ei <= len(lufs_e) else -14.0
             )
             aw = (
                 round(float(np.mean(width_e[si:ei])), 3)
@@ -759,41 +572,41 @@ def _detect_sections(
                 "semantic_context": ctx,
             })
         if sections:
-            return {"sections": sections, "param_guardrails": param_guardrails, "gemini_identity": gemini_identity, "detected_problems": detected_problems}
+            return {"sections": sections, "param_guardrails": param_guardrails, "gemini_identity": gemini_identity}
 
-    # 2. DSP fallback (no Gemini) — degraded mode, no problem detection possible
-    return {"sections": _dsp_fallback(lufs_e, width_e, duration), "param_guardrails": param_guardrails, "gemini_identity": gemini_identity, "detected_problems": []}
+    # 2. DSP fallback (no Gemini)
+    return {"sections": _dsp_fallback(lufs_e, width_e, duration), "param_guardrails": param_guardrails, "gemini_identity": gemini_identity}
 
 
 def _dsp_fallback(
     lufs_e: NDArray, width_e: NDArray, duration: float,
 ) -> List[Dict[str, Any]]:
     """DSP novelty-based segmentation (15s min)."""
-    if len(lufs_e) < MIN_ENVELOPE_FRAMES:
+    if len(lufs_e) < 100:
         return [{
             "section_id": "SEC_0_Full",
             "start_sec": 0.0,
             "end_sec": duration,
             "avg_lufs": round(float(np.mean(lufs_e)), 1)
-            if len(lufs_e) > 0 else FALLBACK_LUFS,
+            if len(lufs_e) > 0 else -14.0,
             "avg_width": round(float(np.mean(width_e)), 3)
             if len(width_e) > 0 else 0.0,
             "semantic_context": None,
         }]
 
-    sw = int(NOVELTY_SMOOTHING_SEC / TIME_SERIES_RESOLUTION_SEC)
+    sw = int(3.0 / TIME_SERIES_RESOLUTION_SEC)
     w = np.ones(sw) / sw
     sl = np.convolve(lufs_e, w, mode="same")
     swi = np.convolve(width_e, w, mode="same")
     ld = np.abs(np.diff(sl))
     wd = np.abs(np.diff(swi))
-    ln = ld / (np.max(ld) + LOG_FLOOR)
-    wn = wd / (np.max(wd) + LOG_FLOOR)
-    nov = ln + (wn * NOVELTY_WIDTH_WEIGHT)
+    ln = ld / (np.max(ld) + 1e-6)
+    wn = wd / (np.max(wd) + 1e-6)
+    nov = ln + (wn * 0.3)
 
-    th = np.mean(nov) + NOVELTY_THRESHOLD_SIGMA * np.std(nov)
+    th = np.mean(nov) + 1.2 * np.std(nov)
     bounds = [0]
-    mc = int(MIN_SECTION_SEC / TIME_SERIES_RESOLUTION_SEC)
+    mc = int(15.0 / TIME_SERIES_RESOLUTION_SEC)
 
     for i in range(1, len(nov) - 1):
         if (
@@ -894,11 +707,118 @@ def _estimate_key(mono: NDArray, sr: int) -> Optional[str]:
     return f"{bk} {bm}"
 
 
-# _detect_problems is intentionally removed.
-# Problem detection is 100% Vertex AI's responsibility.
-# Only the AI that actually listens to the audio has the authority
-# to judge what constitutes a problem for a specific track.
-# See task 7 in the Gemini prompt inside _extract_macro_form().
+def _detect_problems(
+    wm: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Detect engineering issues from measured metrics.
+
+    Returns flag-only problem descriptors. Parameter constraints are
+    generated separately by Vertex AI via _generate_guardrails_via_vertex.
+    """
+    p = []
+    if wm.get("true_peak_dbtp", -100.0) > -0.3:
+        p.append({
+            "issue": "true_peak_danger",
+            "severity": "high",
+            "value": wm["true_peak_dbtp"],
+        })
+    if wm.get("mud_risk", 0.0) > 0.4:
+        p.append({
+            "issue": "mud_risk",
+            "severity": "medium",
+            "value": wm["mud_risk"],
+        })
+    if wm.get("low_mono_correlation_below_120hz", 1.0) < 0.3:
+        p.append({
+            "issue": "phase_cancellation_lows",
+            "severity": "medium",
+            "value": wm["low_mono_correlation_below_120hz"],
+        })
+    if wm.get("harshness_risk", 0.0) > 0.5:
+        p.append({
+            "issue": "harshness_risk",
+            "severity": "medium",
+            "value": wm["harshness_risk"],
+        })
+    if wm.get("crest_db", 20.0) < 3.0:
+        p.append({
+            "issue": "extremely_low_crest_factor",
+            "severity": "low",
+            "value": wm["crest_db"],
+        })
+    return p
+
+
+def _generate_guardrails_via_vertex(
+    metrics: Dict[str, Any],
+    problems: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Ask Vertex AI (Gemini) to generate mastering parameter constraints.
+
+    Given the measured signal metrics and detected problems, Gemini decides
+    the appropriate parameter constraints.  No hardcoded formulas — the AI
+    reasons about the specific signal characteristics.
+    """
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
+    if not project:
+        print("[WARN] GOOGLE_CLOUD_PROJECT not set; skipping guardrail generation.")
+        return None
+
+    if not problems:
+        return {"constraints": [], "overall_assessment": "No issues detected."}
+
+    client = genai.Client(vertexai=True, project=project, location=location)
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+    prompt = f"""You are a mastering engineer safety system. Given the following measured audio metrics and detected problems, output parameter constraints that downstream mastering AI agents MUST respect.
+
+Measured Metrics:
+{json.dumps(metrics, indent=2)}
+
+Detected Problems:
+{json.dumps(problems, indent=2)}
+
+Available DSP parameters you can constrain:
+- transformer_saturation (0-1.0): Odd harmonic saturation
+- transformer_mix (0-1.0): Transformer wet/dry
+- triode_drive (0-1.0): Tube saturation drive
+- triode_mix (0-1.0): Tube wet/dry
+- tape_saturation (0-1.0): Tape compression amount
+- tape_mix (0-1.0): Tape wet/dry
+- eq_low_mid_gain_db (-6 to 6): Low-mid EQ
+- eq_high_mid_gain_db (-6 to 6): High-mid EQ
+- parallel_wet (0-0.5): Parallel saturation amount
+- stereo_low_mono (0-1.0): Low-end monoization below 200Hz
+- comp_ratio (1.5-6): Compressor ratio
+- comp_threshold_db (-24 to -6): Compressor threshold
+- dyn_eq_enabled (0 or 1): Dynamic EQ switch
+
+For each constraint, specify:
+- param_name: exact parameter name from the list above
+- constraint_type: "max" (upper limit), "min" (lower limit), or "force" (override value)
+- value: the numeric constraint value
+- reason: brief technical explanation
+
+Be precise and conservative. Only constrain parameters that the detected problems require.
+Do NOT constrain parameters unnecessarily.
+Provide an overall_assessment summarizing the signal condition."""
+
+    try:
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=[prompt],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=GuardrailResponse,
+                temperature=0.0,
+            ),
+        )
+        result = json.loads(resp.text)
+        return result
+    except Exception as e:
+        print(f"[WARN] Guardrail generation failed: {e}")
+        return None
 
 
 def _detect_bit_depth(fp: str) -> int:
@@ -910,7 +830,7 @@ def _detect_bit_depth(fp: str) -> int:
             return struct.unpack_from("<H", h, 34)[0]
     except Exception:
         pass
-    return FALLBACK_BIT_DEPTH
+    return 24
 
 
 if __name__ == "__main__":
